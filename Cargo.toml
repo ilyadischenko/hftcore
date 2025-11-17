@@ -1,0 +1,28 @@
+[package]
+name = "dual_book_ticker"
+version = "0.1.1"
+edition = "2021"
+
+[[bin]]
+name = "main"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1.39", features = ["full"] }
+tokio-tungstenite = { version = "0.21", features = ["rustls-tls-webpki-roots"] }
+futures-util = "0.3"
+serde = { version = "1.0", features = ["derive"] }
+serde_with = "3"
+serde_json = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+chrono = "0.4"
+anyhow = "1.0"
+axum = "0.7"
+simd-json = { version = "0.13", features = ["serde_impl"] }
+ed25519-dalek = "2.2.0"
+sha2 = "0.10.9"
+hmac = "0.12"
+hex = "0.4"
+ryu = "1.0.20"
+dashmap = "6.1.0"
