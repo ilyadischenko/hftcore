@@ -14,11 +14,12 @@ use serde_json::Value;
 
 mod exchange_data;
 mod exchange_trade;
-// mod strategy_storage;      // ← НОВОЕ
-mod routes;       // ← НОВОЕ
 
-use strategy_storage::StrategyStorage;
-use routes::strategy;
+mod routes;
+mod strategies;
+
+use crate::strategies::StrategyStorage;
+use crate::routes::strategy;
 
 #[derive(Deserialize)]
 struct TickerRequest {
@@ -51,7 +52,7 @@ async fn main() {
 
     // ---- Хранилище стратегий ----------------
     let strategy_storage = Arc::new(
-        StrategyStorage::new("./strategies").expect("Failed to create strategy storage")
+        StrategyStorage::new("./strategies/db").expect("Failed to create strategy storage")
     );
 
     // ---- Маршруты приложения -------------------------
@@ -66,7 +67,7 @@ async fn main() {
         .with_state(app_state.clone())
         
         // ← НОВЫЕ РОУТЫ ДЛЯ СТРАТЕГИЙ
-        .merge(strategy_routes(strategy_storage));
+        .merge(strategy::strategy_routes(strategy_storage));
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await.unwrap();
     tracing::info!("Server running on http://0.0.0.0:8080");
