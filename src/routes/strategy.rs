@@ -8,8 +8,12 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use tokio::sync::broadcast;
 
 use crate::strategies::storage::{StrategyStorage, Strategy, StrategyMetadata};
+use crate::strategies::manager::StrategyRunner;
+use crate::ffi_types::CEvent;
+// use crate::exchange_data::Event;
 
 // ═══════════════════════════════════════════════════════════
 // REQUEST/RESPONSE ТИПЫ
@@ -33,7 +37,7 @@ pub struct UpdateMetadataRequest {
     pub name: Option<String>,
     pub symbol: Option<String>,
     pub enabled: Option<bool>,
-    pub open_positions: Option<bool>
+    pub open_positions: Option<bool>,
 }
 
 #[derive(Serialize)]
@@ -61,7 +65,17 @@ pub struct CompilationResponse {
 }
 
 // ═══════════════════════════════════════════════════════════
-// РОУТЕР
+// STATE для runtime роутов
+// ═══════════════════════════════════════════════════════════
+
+type RuntimeState = (
+    Arc<StrategyStorage>,
+    Arc<StrategyRunner>,
+    broadcast::Sender<CEvent>,
+);
+
+// ═══════════════════════════════════════════════════════════
+// РОУТЕР ДЛЯ CRUD ОПЕРАЦИЙ
 // ═══════════════════════════════════════════════════════════
 
 pub fn strategy_routes(storage: Arc<StrategyStorage>) -> Router {
@@ -87,6 +101,22 @@ pub fn strategy_routes(storage: Arc<StrategyStorage>) -> Router {
 }
 
 // ═══════════════════════════════════════════════════════════
+// РОУТЕР ДЛЯ ЗАПУСКА/ОСТАНОВКИ
+// ═══════════════════════════════════════════════════════════
+
+pub fn runtime_routes(
+    storage: Arc<StrategyStorage>,
+    runner: Arc<StrategyRunner>,
+    event_tx: broadcast::Sender<CEvent>,
+) -> Router {
+    Router::new()
+        .route("/strategies/:id/start", post(start_strategy))
+        .route("/strategies/:id/stop", post(stop_strategy))
+        .route("/strategies/running", get(list_running))
+        .with_state((storage, runner, event_tx))
+}
+
+// ═══════════════════════════════════════════════════════════
 // CRUD ОПЕРАЦИИ
 // ═══════════════════════════════════════════════════════════
 
@@ -95,7 +125,6 @@ async fn create_strategy(
     State(storage): State<Arc<StrategyStorage>>,
     Json(req): Json<CreateStrategyRequest>,
 ) -> (StatusCode, Json<ApiResponse>) {
-    // Создаём стратегию
     let strategy = Strategy::new(
         req.id.clone(),
         req.name,
@@ -103,7 +132,6 @@ async fn create_strategy(
         req.code,
     );
     
-    // Сохраняем
     match storage.create(strategy) {
         Ok(_) => {
             // Сразу пробуем скомпилировать
@@ -254,7 +282,6 @@ async fn update_code(
     Path(id): Path<String>,
     Json(req): Json<UpdateCodeRequest>,
 ) -> (StatusCode, Json<ApiResponse>) {
-    // Сохраняем новый код
     match storage.update_code(&id, req.code) {
         Ok(_) => {
             // Проверяем синтаксис
@@ -280,7 +307,7 @@ async fn update_code(
                                         StatusCode::OK,
                                         Json(ApiResponse {
                                             success: true,
-                                            message: format!("Code updated but compilation failed"),
+                                            message: "Code updated but compilation failed".to_string(),
                                             data: Some(serde_json::json!({
                                                 "compiled": false,
                                                 "errors": compile_result.errors,
@@ -342,7 +369,13 @@ async fn update_metadata(
     Path(id): Path<String>,
     Json(req): Json<UpdateMetadataRequest>,
 ) -> (StatusCode, Json<ApiResponse>) {
-    match storage.update_metadata(&id, req.name, req.symbol, req.enabled, req.open_positions) {
+    match storage.update_metadata(
+        &id,
+        req.name,
+        req.symbol,
+        req.enabled,
+        req.open_positions,
+    ) {
         Ok(_) => (
             StatusCode::OK,
             Json(ApiResponse {
@@ -434,4 +467,117 @@ async fn check_strategy(
             }),
         ),
     }
+}
+
+// ═══════════════════════════════════════════════════════════
+// RUNTIME: ЗАПУСК И ОСТАНОВКА СТРАТЕГИЙ
+// ═══════════════════════════════════════════════════════════
+
+/// POST /strategies/:id/start - запустить стратегию
+async fn start_strategy(
+    State((storage, runner, event_tx)): State<RuntimeState>,
+    Path(id): Path<String>,
+) -> (StatusCode, Json<ApiResponse>) {
+    // Проверяем что стратегия существует
+    if storage.load(&id).is_err() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(ApiResponse {
+                success: false,
+                message: format!("Strategy '{}' not found", id),
+                data: None,
+            }),
+        );
+    }
+    
+    // Получаем путь к библиотеке
+    let lib_path = match storage.get_lib_path(&id) {
+        Ok(path) => path,
+        Err(_) => {
+            // Пробуем скомпилировать
+            match storage.compile(&id) {
+                Ok(result) if result.success => {
+                    result.lib_path.unwrap()
+                }
+                Ok(result) => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(ApiResponse {
+                            success: false,
+                            message: "Compilation failed".to_string(),
+                            data: Some(serde_json::json!({ 
+                                "errors": result.errors 
+                            })),
+                        }),
+                    );
+                }
+                Err(e) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(ApiResponse {
+                            success: false,
+                            message: format!("Compilation error: {}", e),
+                            data: None,
+                        }),
+                    );
+                }
+            }
+        }
+    };
+    
+    // Запускаем стратегию с event receiver
+    match runner.start(
+        id.clone(),
+        lib_path,
+        event_tx.subscribe(),  // ← ЗДЕСЬ передаём receiver!
+    ).await {
+        Ok(_) => (
+            StatusCode::OK,
+            Json(ApiResponse {
+                success: true,
+                message: format!("Strategy '{}' started", id),
+                data: None,
+            }),
+        ),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse {
+                success: false,
+                message: format!("Failed to start: {}", e),
+                data: None,
+            }),
+        ),
+    }
+}
+
+/// POST /strategies/:id/stop - остановить стратегию
+async fn stop_strategy(
+    State((_storage, runner, _event_tx)): State<RuntimeState>,
+    Path(id): Path<String>,
+) -> (StatusCode, Json<ApiResponse>) {
+    match runner.stop(&id).await {
+        Ok(_) => (
+            StatusCode::OK,
+            Json(ApiResponse {
+                success: true,
+                message: format!("Strategy '{}' stopped", id),
+                data: None,
+            }),
+        ),
+        Err(e) => (
+            StatusCode::NOT_FOUND,
+            Json(ApiResponse {
+                success: false,
+                message: format!("Failed to stop: {}", e),
+                data: None,
+            }),
+        ),
+    }
+}
+
+/// GET /strategies/running - список запущенных стратегий
+async fn list_running(
+    State((_storage, runner, _event_tx)): State<RuntimeState>,
+) -> Json<Vec<String>> {
+    Json(runner.list_running())
 }

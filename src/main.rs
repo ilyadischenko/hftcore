@@ -4,13 +4,15 @@ use axum::{
     Router,
 };
 use serde::{Deserialize, Serialize};
-use tokio::time::{Instant, Duration};
+use tokio::{sync::broadcast, time::{Duration, Instant}};
 use std::sync::Arc;
-use crate::exchange_data::{ExchangeData, Event};
+use crate::exchange_data::{ExchangeData};
 use crate::exchange_trade::ExchangeTrade;
 
 use tokio::sync::Mutex;
 use serde_json::Value;
+
+mod ffi_types;
 
 mod exchange_data;
 mod exchange_trade;
@@ -18,8 +20,10 @@ mod exchange_trade;
 mod routes;
 mod strategies;
 
-use crate::strategies::StrategyStorage;
 use crate::routes::strategy;
+use crate::strategies::{StrategyStorage, StrategyRunner};
+use crate::routes::strategy::{strategy_routes, runtime_routes}; 
+use crate::ffi_types::{CEvent};
 
 #[derive(Deserialize)]
 struct TickerRequest {
@@ -30,6 +34,7 @@ struct TickerRequest {
 struct AppContext {
     data_manager: Arc<ExchangeData>,
     trade_manager: Arc<ExchangeTrade>,
+    event_broadcaster: broadcast::Sender<CEvent>,
 }
 
 #[tokio::main]
@@ -39,8 +44,10 @@ async fn main() {
         .compact()
         .init();
 
+    let (event_tx, _) = broadcast::channel::<CEvent>(10000);
+
     // ---- Менеджеры данных и торговли ----------------
-    let data_manager = ExchangeData::new("wss://fstream.binance.com/ws".to_string());
+    let data_manager = ExchangeData::new("wss://fstream.binance.com/ws".to_string(), event_tx.clone());
 
     let trade_manager = ExchangeTrade::new(
         "wss://ws-fapi.binance.com/ws-fapi/v1".to_string(),
@@ -48,12 +55,13 @@ async fn main() {
         "3AJ2HfjBkNPKwfsPswkzAkqVx6Jawm3xSQTOMKJ1ib5e4Wa9DEM5ddvfhDjeqPO4".to_string(),
     );
 
-    let app_state = Arc::new(AppContext { data_manager, trade_manager });
-
+    let app_state = Arc::new(AppContext { data_manager, trade_manager, event_broadcaster: event_tx.clone() });
     // ---- Хранилище стратегий ----------------
     let strategy_storage = Arc::new(
         StrategyStorage::new("./strategies/db").expect("Failed to create strategy storage")
     );
+
+    let strategy_runner = StrategyRunner::new();
 
     // ---- Маршруты приложения -------------------------
     let app = Router::new()
@@ -62,12 +70,14 @@ async fn main() {
         .route("/unsubscribe/bookticker", post(unsubscribe_bookticker))
         .route("/subscribe/trades", post(subscribe_trades))
         .route("/unsubscribe/trades", post(unsubscribe_trades))
-        .route("/latency/bookticker", post(measure_bookticker_latency))
+        // .route("/latency/bookticker", post(measure_bookticker_latency))
         .route("/login", post(login_session))
         .with_state(app_state.clone())
         
+
         // ← НОВЫЕ РОУТЫ ДЛЯ СТРАТЕГИЙ
-        .merge(strategy::strategy_routes(strategy_storage));
+        .merge(strategy::strategy_routes(strategy_storage.clone()))
+        .merge(strategy::runtime_routes(strategy_storage, strategy_runner, event_tx));  // ← НОВОЕ
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await.unwrap();
     tracing::info!("Server running on http://0.0.0.0:8080");
@@ -160,52 +170,3 @@ struct LatencyStats {
     max_latency_ms: f64,
 }
 
-async fn measure_bookticker_latency(
-    State(app): State<Arc<AppContext>>,
-    Json(req): Json<TickerRequest>,
-) -> Json<LatencyStats> {
-    let data_manager = &app.data_manager;
-
-    if let Err(e) = data_manager.subscribe_bookticker(&req.ticker).await {
-        tracing::error!("subscribe error: {e}");
-    }
-
-    let mut rx = data_manager.event_tx.subscribe();
-    let start = Instant::now();
-    let mut latencies = Vec::new();
-
-    while start.elapsed() < Duration::from_secs(10) {
-        if let Ok(Event::BookTicker(bt)) = rx.recv().await {
-            if bt.symbol.eq_ignore_ascii_case(&req.ticker) {
-                let now = chrono::Utc::now().timestamp_millis();
-                latencies.push((now - bt.time) as f64);
-            }
-        }
-    }
-
-    if let Err(e) = data_manager.unsubscribe_bookticker(&req.ticker).await {
-        tracing::warn!("unsubscribe error: {e}");
-    }
-
-    let stats = if latencies.is_empty() {
-        LatencyStats {
-            ticker: req.ticker,
-            avg_latency_ms: 0.0,
-            min_latency_ms: 0.0,
-            max_latency_ms: 0.0,
-        }
-    } else {
-        let sum: f64 = latencies.iter().sum();
-        let avg = sum / latencies.len() as f64;
-        let min = latencies.iter().cloned().fold(f64::INFINITY, f64::min);
-        let max = latencies.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-        LatencyStats {
-            ticker: req.ticker,
-            avg_latency_ms: avg,
-            min_latency_ms: min,
-            max_latency_ms: max,
-        }
-    };
-
-    Json(stats)
-}

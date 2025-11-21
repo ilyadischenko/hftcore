@@ -1,5 +1,5 @@
 [package]
-name = "ma_strategy_hui"
+name = "test_strategy"
 version = "0.1.0"
 edition = "2021"
 
@@ -7,7 +7,7 @@ edition = "2021"
 crate-type = ["cdylib"]
 
 [dependencies]
-strategy_api = { path = "../../strategy_api" }
+crossbeam = "0.8"
 
 [profile.release]
 opt-level = 3

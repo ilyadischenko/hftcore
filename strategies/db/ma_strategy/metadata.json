@@ -1,9 +1,0 @@
-{
-  "id": "ma_strategy",
-  "name": "Moving Average Strategy",
-  "symbol": "BTCUSDT",
-  "enabled": false,
-  "open_positions": true,
-  "created_at": 1763457934,
-  "updated_at": 1763457934
-}

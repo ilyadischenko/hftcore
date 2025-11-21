@@ -29,23 +29,21 @@ pub enum Command {
 }
 
 // ─────────────────────────── Менеджер ───────────────────────────
-pub struct ExchangeManager {
+pub struct ExchangeData {
     ws_url: String,
     is_connected: Arc<Mutex<bool>>,
     cmd_tx: mpsc::Sender<Command>,
     pub event_tx: broadcast::Sender<Event>,
 }
 
-impl ExchangeManager {
-    pub fn new(ws_url: String) -> Arc<Self> {
+impl ExchangeData {
+    pub fn new(ws_url: String, event_tx: broadcast::Sender<Event>) -> Arc<Self> {
         let (cmd_tx, cmd_rx) = mpsc::channel(32);
-        let (event_tx, _) = broadcast::channel(1024);
         let manager = Arc::new(Self {
             ws_url: ws_url.clone(),
             is_connected: Arc::new(Mutex::new(false)),
             cmd_tx,
             event_tx,
-            
         });
         let manager_clone = manager.clone();
         tokio::spawn(async move {
@@ -100,9 +98,9 @@ impl ExchangeManager {
                                 Err(_) => {
                                     // 5 сек тишины
                                     if !waiting_list {
-                                        tracing::warn!(
-                                            "No messages for 5 s — sending LIST_SUBSCRIPTIONS"
-                                        );
+                                        // tracing::warn!(
+                                        //     "No messages for 5 s — sending LIST_SUBSCRIPTIONS"
+                                        // );
                                         if cmd_tx.send(Command::ListSubscriptions).await.is_err() {
                                             tracing::warn!("command channel closed");
                                             *reader_mgr.is_connected.lock().await = false;
@@ -111,9 +109,9 @@ impl ExchangeManager {
                                         waiting_list = true;
                                         list_request_time = Instant::now();
                                     } else if list_request_time.elapsed() > Duration::from_secs(5) {
-                                        tracing::error!(
-                                            "No LIST_SUBSCRIPTIONS answer for 5 s — reconnect"
-                                        );
+                                        // tracing::error!(
+                                        //     "No LIST_SUBSCRIPTIONS answer for 5 s — reconnect"
+                                        // );
                                         *reader_mgr.is_connected.lock().await = false;
                                         break;
                                     }
@@ -145,7 +143,7 @@ impl ExchangeManager {
                 }
                 Err(e) => {
                     *self.is_connected.lock().await = false;
-                    tracing::error!("WS connect error: {e:?}, retrying");
+                    tracing::error!("Data WS connect error: {e:?}, retrying");
                     sleep(Duration::from_secs(3)).await;
                 }
             }

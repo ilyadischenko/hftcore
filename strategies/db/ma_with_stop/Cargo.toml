@@ -1,13 +1,11 @@
 [package]
-name = "ma_strategy"
+name = "ma_with_stop"
 version = "0.1.0"
 edition = "2021"
 
 [lib]
 crate-type = ["cdylib"]
 
-[dependencies]
-strategy_api = { path = "../../strategy_api" }
 
 [profile.release]
 opt-level = 3

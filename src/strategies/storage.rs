@@ -353,7 +353,7 @@ edition = "2021"
 crate-type = ["cdylib"]
 
 [dependencies]
-strategy_api = {{ path = "../../strategy_api" }}
+crossbeam = "0.8"
 
 [profile.release]
 opt-level = 3
@@ -363,6 +363,8 @@ codegen-units = 1
             id
         );
         
+// [dependencies]
+// strategy_api = {{ path = "../../strategy_api" }}
         let cargo_path = strategy_dir.join("Cargo.toml");
         fs::write(&cargo_path, cargo_toml)
             .context("Failed to write Cargo.toml")?;
@@ -403,6 +405,36 @@ codegen-units = 1
         let metadata = serde_json::from_str(&json)
             .context("Failed to parse metadata.json")?;
         Ok(metadata)
+    }
+
+    /// Получить путь к скомпилированной библиотеке
+    pub fn get_lib_path(&self, id: &str) -> Result<PathBuf> {
+        let strategy_dir = self.get_strategy_dir(id);
+        
+        if !strategy_dir.exists() {
+            anyhow::bail!("Strategy '{}' not found", id);
+        }
+        
+        // Определяем имя библиотеки в зависимости от ОС
+        let lib_name = self.get_lib_name(id);
+        
+        // Путь к скомпилированной библиотеке
+        let lib_path = strategy_dir
+            .join("target")
+            .join("release")
+            .join(&lib_name);
+        
+        // Проверяем что библиотека существует
+        if !lib_path.exists() {
+            anyhow::bail!(
+                "Library not compiled for strategy '{}'. Run compile('{}') first.\nExpected path: {:?}",
+                id,
+                id,
+                lib_path
+            );
+        }
+        
+        Ok(lib_path)
     }
     
     /// Получить имя библиотеки в зависимости от ОС
