@@ -9,10 +9,24 @@ use tokio::task::JoinHandle; // Handle на запущенный async task, ч�
 use dashmap::DashMap; // Thread-safe HashMap (можно читать/писать из разных потоков одновременно).
 use anyhow::Result;
 use crossbeam::channel::{bounded, Receiver};
-use crate::exchange_trade::Event;
 use crate::ffi_types::CEvent;
+use std::os::raw::c_char;
+use crate::strategies::order::{
+    OrderResult, 
+    OrderCallback, 
+    PlaceOrderFn,
+    CancelOrderFn,
+    place_order,
+    cancel_order,
+};
 
-type RunFn = unsafe extern "C" fn(rx: *mut Receiver<CEvent>) -> i32;
+
+
+
+type RunFn = unsafe extern "C" fn(
+    rx: *mut Receiver<CEvent>, 
+    place_order: PlaceOrderFn,    // ← добавили
+    cancel_order: CancelOrderFn, ) -> i32;
 type StopFn = unsafe extern "C" fn();
 // Разбор:
 // extern "C" - функция использует C calling convention (совместимо с FFI)
@@ -42,7 +56,6 @@ impl StrategyRunner {
         })
     }
     
-// src/strategies/runner.rs (исправленная версия)
 
     pub async fn start(
         &self,
@@ -110,7 +123,13 @@ impl StrategyRunner {
             let rx_ptr = Box::into_raw(Box::new(sync_rx));
             
             // Вызываем функцию стратегии
-            let result = unsafe { run_fn(rx_ptr) };
+            let result = unsafe { 
+                    run_fn(
+                        rx_ptr,
+                        place_order,
+                        cancel_order,
+                    )
+                 };
             
             tracing::info!("✅ run() returned {} for '{}'", result, strategy_id_clone);
             

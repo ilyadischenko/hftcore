@@ -1,0 +1,9 @@
+{
+  "id": "sol_buyer",
+  "name": "SOL Auto Buyer",
+  "symbol": "SOLUSDT",
+  "enabled": false,
+  "open_positions": true,
+  "created_at": 1763747280,
+  "updated_at": 1763747280
+}

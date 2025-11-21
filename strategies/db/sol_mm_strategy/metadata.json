@@ -1,0 +1,9 @@
+{
+  "id": "sol_mm_strategy",
+  "name": "SOL Market Maker 5% Spread",
+  "symbol": "SOLUSDT",
+  "enabled": false,
+  "open_positions": true,
+  "created_at": 1763745608,
+  "updated_at": 1763745608
+}

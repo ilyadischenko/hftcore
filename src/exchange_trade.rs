@@ -23,6 +23,8 @@ use dashmap::{DashMap, DashSet};
 use sha2::Sha256;
 type HmacSha256 = Hmac<Sha256>;
 
+use std::sync::atomic::AtomicI64;
+
 // ─────────────────────────── События ───────────────────────────
 #[derive(Debug, Clone)]
 pub enum Event {
@@ -32,8 +34,20 @@ pub enum Event {
 // ─────────────────────────── Команды ───────────────────────────
 #[derive(Debug, Clone)]
 pub enum Command {
-    SendLimitOrder(String, f64, f64, String),
-    CancelLimitOrder(String, String),
+    SendLimitOrder {
+        api_key: String,
+        secret_key: String,
+        symbol: String,
+        price: f64,
+        qty: f64,
+        side: String,
+    },
+    CancelLimitOrder {
+        api_key: String,
+        secret_key: String,
+        symbol: String,
+        order_id: String,
+    },
 }
 
 // ─────────────────────────── Внутренние типы ───────────────────────────
@@ -53,36 +67,35 @@ enum Ctrl {
 
 pub struct ExchangeTrade {
     ws_url: String,
-    api_key: String,
-    secret_key: String,
+    // ← УБРАЛИ api_key и secret_key
 
     is_connected: AtomicBool,
 
     // Очереди
-    out_tx: mpsc::Sender<Outbound>,  // пользовательские сообщения
-    ctrl_tx: mpsc::Sender<Ctrl>,     // служебные (Pong)
+    out_tx: mpsc::Sender<Outbound>,
+    ctrl_tx: mpsc::Sender<Ctrl>,
 
     pub event_tx: broadcast::Sender<Event>,
 
-    // id -> callback (ждем ответ)
     pending: DashMap<String, Callback>,
-
-    // Набор "отправлено в сокет, но нет ответа" — только ID, без payload.
     inflight_ids: DashSet<String>,
-
     id_counter: AtomicU64,
+    
+    time_offset_ms: AtomicI64,
 }
 
 impl ExchangeTrade {
-    pub fn new(ws_url: String, api_key: String, secret_key: String) -> Arc<Self> {
+    // ═══════════════════════════════════════════════════════════
+    // ИЗМЕНЕНИЕ: new() БЕЗ api_key и secret_key
+    // ═══════════════════════════════════════════════════════════
+    pub fn new(ws_url: String) -> Arc<Self> {
         let (out_tx, out_rx) = mpsc::channel::<Outbound>(8192);
         let (ctrl_tx, ctrl_rx) = mpsc::channel::<Ctrl>(256);
         let (event_tx, _) = broadcast::channel::<Event>(2048);
 
         let mgr = Arc::new(Self {
             ws_url: ws_url.clone(),
-            api_key,
-            secret_key,
+            // ← УБРАЛИ
             is_connected: AtomicBool::new(false),
             out_tx,
             ctrl_tx,
@@ -90,9 +103,9 @@ impl ExchangeTrade {
             pending: DashMap::new(),
             inflight_ids: DashSet::new(),
             id_counter: AtomicU64::new(0),
+            time_offset_ms: AtomicI64::new(0),
         });
 
-        // WS-цикл
         {
             let mgr_clone = mgr.clone();
             tokio::spawn(async move {
@@ -114,49 +127,38 @@ impl ExchangeTrade {
         mut out_rx: mpsc::Receiver<Outbound>,
         mut ctrl_rx: mpsc::Receiver<Ctrl>,
     ) {
-        // Сообщения, которые мы уже достали из out_rx, но так и не отправили в сокет (ошибка записи).
-        // Они безопасно уйдут при следующем коннекте, это не реплей — они еще не уходили в сеть.
-        let mut backlog: std::collections::VecDeque<Outbound> = std::collections::VecDeque::new();
+        let mut backlog: VecDeque<Outbound> = VecDeque::new();
 
         loop {
             tracing::info!("Trying to connect trade WS: {}", ws_url);
-            match tokio_tungstenite::connect_async(&ws_url).await {
+            match connect_async(&ws_url).await {
                 Ok((ws, _resp)) => {
                     tracing::info!("Connected to {}", ws_url);
-                    self.is_connected.store(true, std::sync::atomic::Ordering::Relaxed);
+                    self.is_connected.store(true, Ordering::Relaxed);
                     let (mut write, mut read) = ws.split();
 
-                    // Reader
-                    let (done_tx, mut done_rx) = tokio::sync::oneshot::channel::<()>();
+                    let (done_tx, mut done_rx) = oneshot::channel::<()>();
                     let reader_mgr = self.clone();
                     let reader_ctrl_tx = self.ctrl_tx.clone();
 
                     tokio::spawn(async move {
                         loop {
-                            match tokio::time::timeout(std::time::Duration::from_secs(30), read.next()).await {
+                            match timeout(Duration::from_secs(30), read.next()).await {
                                 Ok(Some(Ok(msg))) => {
-                                    use tokio_tungstenite::tungstenite::Message;
                                     match msg {
                                         Message::Text(txt) => {
                                             reader_mgr.handle_text(txt).await;
                                         }
-                                        Message::Binary(_bin) => {
-                                            // при необходимости обработать
-                                        }
+                                        Message::Binary(_) => {}
                                         Message::Ping(data) => {
-                                            // быстрый ответ Pong — без блокировки ридера
                                             let _ = reader_ctrl_tx.try_send(Ctrl::Pong(data));
                                         }
-                                        Message::Pong(_) => {
-                                            // ok
-                                        }
+                                        Message::Pong(_) => {}
                                         Message::Close(cf) => {
-                                            tracing::warn!("WS close by server: {:?}", cf);
+                                            tracing::warn!("WS close: {:?}", cf);
                                             break;
                                         }
-                                        _ => {
-                                            // покрывает Message::Frame(_) и возможные будущие варианты
-                                        }
+                                        _ => {}
                                     }
                                 }
                                 Ok(Some(Err(e))) => {
@@ -167,30 +169,22 @@ impl ExchangeTrade {
                                     tracing::warn!("WS stream ended");
                                     break;
                                 }
-                                Err(_elapsed) => {
-                                    // таймаут ожидания сообщения
-                                    tracing::debug!("No messages for 30s (reader)");
-                                }
+                                Err(_) => {}
                             }
                         }
                         let _ = done_tx.send(());
                     });
 
-                    // Writer loop (+ ping). НИКАКОГО реплея отправленного ранее.
-                    let mut ping_tick = tokio::time::interval(std::time::Duration::from_secs(15));
+                    let mut ping_tick = interval(Duration::from_secs(15));
                     let mut connected = true;
 
-                    // 1) Сначала пытаемся вывести backlog (эти сообщения не были отправлены ранее)
                     while let Some(ob) = backlog.pop_front() {
-                        match write.send(tokio_tungstenite::tungstenite::Message::Text((*ob.payload).clone())).await {
+                        match write.send(Message::Text((*ob.payload).clone())).await {
                             Ok(_) => {
-                                // Помечаем как реально отправленное — теперь ждём ответ
                                 self.inflight_ids.insert(ob.id.clone());
-                                tracing::trace!("Sent from backlog id={}", ob.id);
                             }
                             Err(e) => {
                                 tracing::error!("WS send(backlog) error: {}", e);
-                                // Возвращаем обратно и разрываем цикл — попробуем при следующем подключении
                                 backlog.push_front(ob);
                                 connected = false;
                                 break;
@@ -198,49 +192,44 @@ impl ExchangeTrade {
                         }
                     }
 
-                    // 2) Основной цикл записи
                     while connected {
-                        tokio::select! {
+                        select! {
                             _ = &mut done_rx => {
-                                tracing::warn!("Reader finished — closing writer");
+                                tracing::warn!("Reader finished");
                                 connected = false;
                             }
 
                             _ = ping_tick.tick() => {
-                                if let Err(e) = write.send(tokio_tungstenite::tungstenite::Message::Ping(Vec::new())).await {
-                                    tracing::error!("WS ping send error: {}", e);
+                                if let Err(e) = write.send(Message::Ping(Vec::new())).await {
+                                    tracing::error!("WS ping error: {}", e);
                                     connected = false;
                                 }
                             }
 
                             ctrl = ctrl_rx.recv() => {
                                 if let Some(Ctrl::Pong(data)) = ctrl {
-                                    if let Err(e) = write.send(tokio_tungstenite::tungstenite::Message::Pong(data)).await {
-                                        tracing::error!("WS pong send error: {}", e);
+                                    if let Err(e) = write.send(Message::Pong(data)).await {
+                                        tracing::error!("WS pong error: {}", e);
                                         connected = false;
                                     }
-                                } // если канал ctrl закрыт — просто игнорируем
+                                }
                             }
 
                             msg = out_rx.recv() => {
                                 match msg {
                                     Some(ob) => {
-                                        match write.send(tokio_tungstenite::tungstenite::Message::Text((*ob.payload).clone())).await {
+                                        match write.send(Message::Text((*ob.payload).clone())).await {
                                             Ok(_) => {
-                                                // Ушло в сеть — ждём ответ по id
                                                 self.inflight_ids.insert(ob.id.clone());
-                                                tracing::trace!("Sent id={}", ob.id);
                                             }
                                             Err(e) => {
                                                 tracing::error!("WS send error: {}", e);
-                                                // Это сообщение НЕ было отправлено — складываем в backlog
                                                 backlog.push_front(ob);
                                                 connected = false;
                                             }
                                         }
                                     }
                                     None => {
-                                        // out канал закрыт приложением — завершаем
                                         tracing::warn!("Outbound channel closed");
                                         connected = false;
                                     }
@@ -249,25 +238,20 @@ impl ExchangeTrade {
                         }
                     }
 
-                    // Соединение закрыто: помечаем дисконнект и фейлим только реально отправленные (in-flight)
-                    self.is_connected.store(false, std::sync::atomic::Ordering::Relaxed);
-
-                    // Не пытаемся дожидаться done_rx ещё раз — он уже мог отработать в select.
+                    self.is_connected.store(false, Ordering::Relaxed);
                     self.fail_inflight_on_disconnect().await;
 
                     tracing::info!("Reconnecting in 2s...");
-                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    sleep(Duration::from_secs(2)).await;
                 }
                 Err(e) => {
-                    self.is_connected.store(false, std::sync::atomic::Ordering::Relaxed);
-                    tracing::error!("WS connect error: {e:?}, retrying in 2s");
-                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    self.is_connected.store(false, Ordering::Relaxed);
+                    tracing::error!("WS connect error: {:?}", e);
+                    sleep(Duration::from_secs(2)).await;
                 }
             }
         }
     }
-
-
 
     async fn fail_inflight_on_disconnect(&self) {
         let ids: Vec<String> = self.inflight_ids.iter().map(|id| id.clone()).collect();
@@ -278,7 +262,7 @@ impl ExchangeTrade {
                 tokio::spawn(async move {
                     let v = json!({
                         "id": id_cl,
-                        "error": { "code": "Disconnected", "message": "Connection closed before response" }
+                        "error": { "code": "Disconnected", "message": "Connection closed" }
                     });
                     (cb)(v);
                 });
@@ -286,12 +270,10 @@ impl ExchangeTrade {
         }
     }
 
-    // ─────────────────────────── Handle responses ───────────────────────────
     async fn handle_text(&self, txt: String) {
-        // безопасный путь: парсим из &mut [u8]
         let mut bytes = txt.into_bytes();
         let parsed = simd_serde::from_slice::<Value>(&mut bytes)
-            .or_else(|_e| serde_json::from_slice::<Value>(&bytes));
+            .or_else(|_| serde_json::from_slice::<Value>(&bytes));
 
         let v = match parsed {
             Ok(v) => v,
@@ -316,7 +298,6 @@ impl ExchangeTrade {
         let _ = self.event_tx.send(Event::Raw(v));
     }
 
-
     fn extract_id(v: &Value) -> Option<String> {
         match v.get("id") {
             Some(Value::String(s)) => Some(s.clone()),
@@ -325,21 +306,27 @@ impl ExchangeTrade {
         }
     }
 
-    // ─────────────────────────── Message builder ───────────────────────────
+    // ═══════════════════════════════════════════════════════════
+    // ИЗМЕНЕНИЕ: берем ключи из команды
+    // ═══════════════════════════════════════════════════════════
     fn build_message_for_cmd(&self, cmd: &Command, id: &str) -> Option<String> {
-        let ts = Utc::now().timestamp_millis().to_string();
-        let api_key = self.api_key.clone();
-        let secret = self.secret_key.clone();
+        let local_time_ms = Utc::now().timestamp_millis();
+        
+        // Применяем offset (может быть положительным или отрицательным)
+        let offset = self.time_offset_ms.load(Ordering::Relaxed);
+        let adjusted_time_ms = local_time_ms + offset;
+        
+        let ts = adjusted_time_ms.to_string();
 
         match cmd {
-            Command::SendLimitOrder(symbol, price, qty, side) => {
+            Command::SendLimitOrder { api_key, secret_key, symbol, price, qty, side } => {
                 let mut buf_price = Buffer::new();
                 let mut buf_qty = Buffer::new();
                 let price_str = buf_price.format(*price);
                 let qty_str = buf_qty.format(*qty);
 
                 let mut p: BTreeMap<&str, String> = BTreeMap::new();
-                p.insert("apiKey", api_key.to_string());
+                p.insert("apiKey", api_key.clone());
                 p.insert("positionSide", "BOTH".to_string());
                 p.insert("price", price_str.to_string());
                 p.insert("quantity", qty_str.to_string());
@@ -352,12 +339,12 @@ impl ExchangeTrade {
 
                 let query = p.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join("&");
 
-                let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).ok()?;
+                let mut mac = HmacSha256::new_from_slice(secret_key.as_bytes()).ok()?;
                 mac.update(query.as_bytes());
                 let signature = hex::encode(mac.finalize().into_bytes());
 
                 let mut params_json = serde_json::Map::new();
-                params_json.insert("apiKey".into(), Value::String(api_key));
+                params_json.insert("apiKey".into(), Value::String(api_key.clone()));
                 params_json.insert("positionSide".into(), Value::String("BOTH".into()));
                 params_json.insert("price".into(), Value::Number(serde_json::Number::from_f64(*price)?));
                 params_json.insert("quantity".into(), Value::Number(serde_json::Number::from_f64(*qty)?));
@@ -378,17 +365,17 @@ impl ExchangeTrade {
                 Some(msg_json.to_string())
             }
 
-            Command::CancelLimitOrder(symbol, order_id) => {
+            Command::CancelLimitOrder { api_key, secret_key, symbol, order_id } => {
                 let mut p: BTreeMap<&str, String> = BTreeMap::new();
-                p.insert("apiKey", api_key);
+                p.insert("apiKey", api_key.clone());
                 p.insert("orderId", order_id.clone());
                 p.insert("recvWindow", "5000".to_string());
                 p.insert("symbol", symbol.to_uppercase());
-                p.insert("timestamp", Utc::now().timestamp_millis().to_string());
+                p.insert("timestamp", ts);
 
                 let query = p.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join("&");
 
-                let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).ok()?;
+                let mut mac = HmacSha256::new_from_slice(secret_key.as_bytes()).ok()?;
                 mac.update(query.as_bytes());
                 let sig_hex = hex::encode(mac.finalize().into_bytes());
 
@@ -408,7 +395,9 @@ impl ExchangeTrade {
         }
     }
 
-    // ─────────────────────────── Public API ───────────────────────────
+    // ═══════════════════════════════════════════════════════════
+    // PUBLIC API
+    // ═══════════════════════════════════════════════════════════
 
     pub async fn send_command<F>(&self, cmd: Command, callback: F)
     where
@@ -422,18 +411,20 @@ impl ExchangeTrade {
 
         let payload: SharedStr = Arc::new(payload_str);
 
-        // Регистрируем колбэк до отправки (чтобы не пропустить быстрый ответ)
         self.pending.insert(id.clone(), Arc::new(callback));
 
-        // Отправляем в writer-очередь (await — backpressure, без блокировки потока)
         if let Err(e) = self.out_tx.send(Outbound { id, payload }).await {
             tracing::error!("Outbound channel send error: {}", e);
-            // Канал закрыт приложением — pending останется, но ответ уже не придет.
         }
     }
 
+    // ═══════════════════════════════════════════════════════════
+    // ИЗМЕНЕНИЕ: send_limit_order принимает api_key и secret_key
+    // ═══════════════════════════════════════════════════════════
     pub async fn send_limit_order<F>(
         &self,
+        api_key: &str,
+        secret_key: &str,
         symbol: &str,
         price: f64,
         size: f64,
@@ -443,7 +434,14 @@ impl ExchangeTrade {
         F: Fn(Value) + Send + Sync + 'static,
     {
         self.send_command(
-            Command::SendLimitOrder(symbol.into(), price, size, side.into()),
+            Command::SendLimitOrder {
+                api_key: api_key.to_string(),
+                secret_key: secret_key.to_string(),
+                symbol: symbol.to_string(),
+                price,
+                qty: size,
+                side: side.to_string(),
+            },
             callback,
         )
         .await;
@@ -451,6 +449,8 @@ impl ExchangeTrade {
 
     pub async fn cancel_limit_order<F>(
         &self,
+        api_key: &str,
+        secret_key: &str,
         symbol: &str,
         order_id: &str,
         callback: F,
@@ -458,9 +458,98 @@ impl ExchangeTrade {
         F: Fn(Value) + Send + Sync + 'static,
     {
         self.send_command(
-            Command::CancelLimitOrder(symbol.into(), order_id.into()),
+            Command::CancelLimitOrder {
+                api_key: api_key.to_string(),
+                secret_key: secret_key.to_string(),
+                symbol: symbol.to_string(),
+                order_id: order_id.to_string(),
+            },
             callback,
         )
         .await;
+    }
+
+        // ═══════════════════════════════════════════════════════════
+    // НОВЫЙ МЕТОД: синхронизация времени с Binance
+    // ═══════════════════════════════════════════════════════════
+    
+    /// Синхронизирует локальное время с сервером Binance
+    /// 
+    /// Алгоритм:
+    /// 1. Запрашивает GET https://fapi.binance.com/fapi/v1/time
+    /// 2. Получает {"serverTime": 1700000000000}
+    /// 3. Вычисляет offset = server_time - local_time
+    /// 4. Сохраняет offset в AtomicI64
+    /// 
+    /// Пример:
+    /// - Local time:  1700000001500 (ваше время)
+    /// - Server time: 1700000000000 (Binance время)
+    /// - Offset:      -1500ms       (на столько уменьшаем timestamp в запросах)
+    pub async fn sync_time(&self) -> anyhow::Result<i64> {
+        tracing::info!("⏰ Syncing time with Binance server...");
+        
+        // Запоминаем время ДО запроса (для учёта network latency)
+        let t0 = Utc::now().timestamp_millis();
+        
+        // Выполняем HTTP GET запрос
+        let client = reqwest::Client::new();
+        let resp = client
+            .get("https://fapi.binance.com/fapi/v1/time")
+            .timeout(std::time::Duration::from_secs(5))
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("HTTP request failed: {}", e))?;
+        
+        // Время ПОСЛЕ получения ответа
+        let t1 = Utc::now().timestamp_millis();
+        
+        // Парсим JSON: {"serverTime": 1700000000000}
+        let json: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| anyhow::anyhow!("JSON parse failed: {}", e))?;
+        
+        // Извлекаем serverTime
+        let server_time = json["serverTime"]
+            .as_i64()
+            .ok_or_else(|| anyhow::anyhow!("Missing serverTime in response"))?;
+        
+        // ═══════════════════════════════════════════════════════════
+        // ВЫЧИСЛЕНИЕ OFFSET с учётом сетевой задержки
+        // ═══════════════════════════════════════════════════════════
+        
+        // Сетевая задержка (round-trip time)
+        let network_delay = t1 - t0;
+        
+        // Предполагаем что задержка симметрична: request_time ≈ response_time
+        // Значит серверное время соответствует середине интервала
+        let local_time_when_server_responded = t0 + network_delay / 2;
+        
+        // Offset = сколько нужно ДОБАВИТЬ к локальному времени чтобы получить серверное
+        let offset = server_time - local_time_when_server_responded;
+        
+        // Сохраняем в AtomicI64 (thread-safe)
+        self.time_offset_ms.store(offset, Ordering::Relaxed);
+        
+        tracing::info!(
+            "✅ Time synchronized | local={} server={} offset={}ms latency={}ms",
+            local_time_when_server_responded,
+            server_time,
+            offset,
+            network_delay
+        );
+        
+        Ok(offset)
+    }
+    
+    /// Установить offset вручную (для тестирования)
+    pub fn set_time_offset(&self, offset_ms: i64) {
+        self.time_offset_ms.store(offset_ms, Ordering::Relaxed);
+        tracing::info!("⏰ Time offset manually set to {}ms", offset_ms);
+    }
+    
+    /// Получить текущий offset
+    pub fn get_time_offset(&self) -> i64 {
+        self.time_offset_ms.load(Ordering::Relaxed)
     }
 }

@@ -194,11 +194,10 @@ impl ExchangeData {
                     
                     // let book = unsafe { &c_event.data.book_ticker };
                     // println!(
-                    //     "📊 BOOK {:>10} bid={:<10.4} ask={:<10.4} Δ{:?}",
+                    //     "📊 BOOK {:>10} bid={:<10.4} ask={:<10.4}",
                     //     book.symbol_str(),
                     //     book.bid_price,
                     //     book.ask_price,
-                    //     start.elapsed()
                     // );
 
                     // Отправляем C-тип
@@ -236,12 +235,11 @@ impl ExchangeData {
                     // let trade = unsafe { &c_event.data.trade };
                     // let side = if trade.qty > 0.0 { "BUY" } else { "SELL" };
                     // println!(
-                    //     "💰 TRADE {:>10} price={:<10.4} qty={:<8.4} {} Δ{:?}",
+                    //     "💰 TRADE {:>10} price={:<10.4} qty={:<8.4} {}",
                     //     trade.symbol_str(),
                     //     trade.price,
                     //     trade.qty.abs(),
-                    //     side,
-                    //     start.elapsed()
+                    //     side
                     // );
 
                     let _ = self.event_tx.send(c_event);
