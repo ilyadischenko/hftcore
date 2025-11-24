@@ -1,0 +1,866 @@
+```
+# HFT Trading Core - Полный контекст проекта
+
+Я разрабатываю высокочастотное торговое ядро на Rust с поддержкой динамических стратегий (hot-reload через cdylib).
+
+## 1. АРХИТЕКТУРА СИСТЕМЫ
+
+### 1.1 Основные компоненты:
+
+- **ExchangeData** (exchange_data.rs)
+  - WebSocket: wss://fstream.binance.com/ws
+  - Подписка на BookTicker и Trades
+  - Парсинг через simd_json (unsafe, мутабельный буфер)
+  - Конвертация JSON → C-типы (CEvent)
+  - Broadcast channel: 10000 элементов
+  - Auto-reconnect через 3 сек при обрыве
+
+- **ExchangeTrade** (exchange_trade.rs)
+  - WebSocket: wss://ws-fapi.binance.com/ws-fapi/v1
+  - HMAC-SHA256 подпись запросов
+  - Time sync с Binance через GET /fapi/v1/time
+  - Backlog механизм для неотправленных ордеров
+  - DashMap для pending callbacks
+  - Ping каждые 15 сек, timeout 30 сек
+
+- **StrategyStorage** (strategies/storage.rs)
+  - CRUD операции над стратегиями
+  - Компиляция через cargo build --release
+  - Копирование шаблонов из copy_into_strategies/
+  - Хранение в strategies/db/{strategy_id}/
+
+- **StrategyRunner** (strategies/manager.rs)
+  - Динамическая загрузка .so/.dll/.dylib через libloading
+  - Bridge: async (broadcast) → sync (crossbeam bounded)
+  - spawn_blocking для запуска стратегий
+  - Graceful shutdown с timeout 5 сек
+
+### 1.2 Поток данных:
+
+```
+Binance WebSocket (market data)
+       ↓
+simd_json парсинг
+       ↓
+CEvent {event_type, data, received_at_ns}
+       ↓
+broadcast::channel<CEvent>(10000)
+       ↓
+event_rx.recv() [async tokio]
+       ↓
+Bridge task: try_send → crossbeam::bounded(8192)
+       ↓
+Receiver<CEvent> [sync, в spawn_blocking]
+       ↓
+Стратегия (cdylib) получает *mut Receiver<CEvent>
+       ↓
+Обработка → place_order() FFI
+       ↓
+tokio::runtime::Handle::spawn()
+       ↓
+ExchangeTrade.send_limit_order()
+       ↓
+Binance WebSocket (trading)
+```
+
+## 2. C FFI ТИПЫ
+
+### 2.1 События (copy_into_strategies/types.rs):
+
+```rust
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct CEvent {
+    pub event_type: u8,        // 0 = BookTicker, 1 = Trade
+    pub data: CEventData,
+    pub received_at_ns: u64,   // SystemTime::UNIX_EPOCH.as_nanos()
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub union CEventData {
+    pub book_ticker: CBookTicker,
+    pub trade: CTrade,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct CBookTicker {
+    pub symbol: [u8; 16],      // фиксированный массив
+    pub symbol_len: u8,        // реальная длина символа
+    pub bid_price: f64,
+    pub ask_price: f64,
+    pub bid_qty: f64,
+    pub ask_qty: f64,
+    pub time: i64,             // exchange timestamp
+}
+
+impl CBookTicker {
+    pub fn symbol_str(&self) -> &str {
+        unsafe { std::str::from_utf8_unchecked(&self.symbol[..self.symbol_len as usize]) }
+    }
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct CTrade {
+    pub symbol: [u8; 16],
+    pub symbol_len: u8,
+    pub price: f64,
+    pub qty: f64,              // ОТРИЦАТЕЛЬНЫЙ если is_maker=true
+    pub time: i64,
+}
+
+impl CTrade {
+    pub fn symbol_str(&self) -> &str {
+        unsafe { std::str::from_utf8_unchecked(&self.symbol[..self.symbol_len as usize]) }
+    }
+}
+```
+
+### 2.2 Торговые типы:
+
+```rust
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct OrderResult {
+    pub success: bool,
+    pub order_id: i64,         // -1 если ошибка
+    pub error_code: i32,       // Binance error code или 0
+}
+
+pub type OrderCallback = unsafe extern "C" fn(result: OrderResult);
+
+pub type PlaceOrderFn = unsafe extern "C" fn(
+    api_key: *const c_char,
+    secret_key: *const c_char,
+    symbol: *const c_char,
+    price: f64,
+    quantity: f64,
+    side: *const c_char,        // "BUY" или "SELL"
+    callback: OrderCallback,
+);
+
+pub type CancelOrderFn = unsafe extern "C" fn(
+    api_key: *const c_char,
+    secret_key: *const c_char,
+    symbol: *const c_char,
+    order_id: i64,
+    callback: OrderCallback,
+);
+```
+
+## 3. СТРУКТУРА ФАЙЛОВ
+
+### 3.1 Проект:
+
+```
+project_root/
+├── Cargo.toml
+├── src/
+│   ├── main.rs                     # Axum сервер, AppContext
+│   ├── exchange_data.rs            # Market data WS
+│   ├── exchange_trade.rs           # Trading WS
+│   ├── ffi_types.rs                # CEvent для основного крейта
+│   └── strategies/
+│       ├── mod.rs
+│       ├── storage.rs              # CRUD, компиляция
+│       ├── manager.rs              # StrategyRunner (libloading)
+│       └── order.rs                # FFI функции place_order/cancel_order
+│
+├── routes/
+│   └── strategy.rs                 # API endpoints
+│
+├── copy_into_strategies/           # ШАБЛОНЫ
+│   ├── types.rs                    # C FFI типы (копируются в каждую стратегию)
+│   └── Cargo.toml                  # с {{STRATEGY_NAME}} placeholder
+│
+└── strategies/db/                  # ХРАНИЛИЩЕ СТРАТЕГИЙ
+    └── {strategy_id}/
+        ├── Cargo.toml              # name = "strategy_id", crate-type = ["cdylib"]
+        ├── metadata.json           # {id, name, symbol, enabled, created_at, updated_at}
+        ├── src/
+        │   ├── types.rs            # КОПИЯ из copy_into_strategies/types.rs
+        │   └── lib.rs              # mod types; use types::*; + пользовательский код
+        └── target/release/
+            └── libstrategy_id.so   # скомпилированная библиотека
+```
+
+### 3.2 metadata.json формат:
+
+```json
+{
+  "id": "sol_buyer",
+  "name": "SOL Buyer Strategy",
+  "symbol": "SOLUSDT",
+  "enabled": false,
+  "open_positions": true,
+  "created_at": 1700000000,
+  "updated_at": 1700000000
+}
+```
+
+## 4. СТРАТЕГИИ
+
+### 4.1 Минимальная стратегия:
+
+```rust
+use crossbeam::channel::Receiver;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
+use std::ffi::CString;
+
+static STOP_FLAG: AtomicBool = AtomicBool::new(false);
+
+unsafe extern "C" fn order_callback(result: OrderResult) {
+    if result.success {
+        println!("✅ Order ID: {}", result.order_id);
+    } else {
+        println!("❌ Error code: {}", result.error_code);
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn run(
+    rx_ptr: *mut Receiver<CEvent>,
+    place_order: PlaceOrderFn,
+    cancel_order: CancelOrderFn,
+) -> i32 {
+    let rx = unsafe { &*rx_ptr };
+    
+    let api_key = CString::new("YOUR_API_KEY").unwrap();
+    let secret_key = CString::new("YOUR_SECRET").unwrap();
+    let symbol = CString::new("SOLUSDT").unwrap();
+    let side = CString::new("BUY").unwrap();
+    
+    while !STOP_FLAG.load(Ordering::Relaxed) {
+        match rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(event) => {
+                match event.event_type {
+                    0 => {
+                        let bt = unsafe { &event.data.book_ticker };
+                        // Логика стратегии
+                    }
+                    1 => {
+                        let trade = unsafe { &event.data.trade };
+                        // Обработка трейдов
+                    }
+                    _ => {}
+                }
+            }
+            Err(crossbeam::channel::RecvTimeoutError::Timeout) => continue,
+            Err(_) => break,
+        }
+    }
+    0
+}
+
+#[no_mangle]
+pub extern "C" fn stop() {
+    STOP_FLAG.store(true, Ordering::Relaxed);
+}
+```
+
+### 4.2 Отправка ордера из стратегии:
+
+```rust
+unsafe {
+    place_order(
+        api_key.as_ptr(),
+        secret_key.as_ptr(),
+        symbol.as_ptr(),
+        127.50,              // price
+        1.0,                 // quantity
+        side.as_ptr(),
+        order_callback,      // будет вызван асинхронно
+    );
+}
+```
+
+## 5. STORAGE (strategies/storage.rs)
+
+### 5.1 Ключевые методы:
+
+```rust
+impl StrategyStorage {
+    pub fn new(base_path: &str) -> Result<Self> {
+        // base_path обычно "strategies/db"
+        // Проверяет наличие copy_into_strategies/
+        // Загружает шаблоны types.rs и Cargo.toml
+    }
+    
+    pub fn create(&self, strategy: Strategy) -> Result<()> {
+        // 1. Создаёт папку strategies/db/{id}/src/
+        // 2. Копирует Cargo.toml (заменяет {{STRATEGY_NAME}} на id)
+        // 3. Копирует types.rs в src/
+        // 4. Сохраняет код в src/lib.rs (добавляет "mod types; use types::*;\n\n")
+        // 5. Сохраняет metadata.json
+    }
+    
+    pub fn load(&self, id: &str) -> Result<Strategy> {
+        // Загружает metadata.json и src/lib.rs
+        // load_code() убирает "mod types; use types::*;\n\n" префикс
+    }
+    
+    pub fn update_code(&self, id: &str, new_code: String) -> Result<()> {
+        // Проверяет наличие types.rs, если нет - копирует
+        // save_code() добавляет импорт обратно
+        // Обновляет updated_at
+    }
+    
+    pub fn compile(&self, id: &str) -> Result<CompilationResult> {
+        // Запускает: cargo build --release --manifest-path {path}/Cargo.toml
+        // Возвращает путь к lib{id}.so или ошибки компиляции
+    }
+    
+    pub fn check(&self, id: &str) -> Result<CompilationResult> {
+        // cargo check (быстрая проверка синтаксиса без линковки)
+    }
+}
+```
+
+### 5.2 copy_into_strategies/Cargo.toml:
+
+```toml
+[package]
+name = "{{STRATEGY_NAME}}"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+crossbeam = "0.8"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+```
+
+## 6. STRATEGY RUNNER (strategies/manager.rs)
+
+### 6.1 Архитектура запуска:
+
+```rust
+pub async fn start(
+    &self,
+    strategy_id: String,
+    lib_path: PathBuf,
+    mut event_rx: broadcast::Receiver<CEvent>,
+) -> Result<()> {
+    // 1. Загружаем библиотеку
+    let lib: Arc<Library> = Arc::new(unsafe { Library::new(&lib_path)? });
+    
+    // 2. Создаём crossbeam bounded channel для sync
+    let (sync_tx, sync_rx) = bounded::<CEvent>(8192);
+    
+    // 3. Bridge task: async → sync
+    let bridge_task = tokio::spawn(async move {
+        while let Ok(event) = event_rx.recv().await {
+            match sync_tx.try_send(event) {
+                Ok(_) => {},
+                Err(crossbeam::channel::TrySendError::Full(_)) => {
+                    // Стратегия отстаёт, дропаем событие
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    
+    // 4. Загружаем функции из библиотеки
+    let run_fn: RunFn = unsafe { *lib.get(b"run")? };
+    let stop_fn: StopFn = unsafe { *lib.get(b"stop")? };
+    
+    // 5. Запускаем стратегию в blocking thread
+    let task = tokio::task::spawn_blocking(move || {
+        let rx_ptr = Box::into_raw(Box::new(sync_rx));
+        
+        let result = unsafe { 
+            run_fn(
+                rx_ptr,
+                crate::strategies::order::place_order,
+                crate::strategies::order::cancel_order,
+            )
+        };
+        
+        unsafe { let _ = Box::from_raw(rx_ptr); }
+        drop(lib_clone);
+    });
+    
+    // 6. Сохраняем в DashMap
+    self.running.insert(strategy_id, RunningStrategy {
+        _lib: lib,
+        stop_fn,
+        task,
+        bridge_task,
+    });
+}
+```
+
+### 6.2 Остановка:
+
+```rust
+pub async fn stop(&self, strategy_id: &str) -> Result<()> {
+    let (_, running) = self.running.remove(strategy_id)?;
+    
+    // 1. Вызываем stop() из DLL
+    unsafe { (running.stop_fn)(); }
+    
+    // 2. Останавливаем bridge
+    running.bridge_task.abort();
+    
+    // 3. Ждём завершения с timeout
+    tokio::time::timeout(Duration::from_secs(5), running.task).await?;
+}
+```
+
+## 7. FFI ОРДЕРА (strategies/order.rs)
+
+### 7.1 Глобальный менеджер:
+
+```rust
+static TRADE_MANAGER: OnceLock<Arc<ExchangeTrade>> = OnceLock::new();
+
+pub fn init_trading(manager: Arc<ExchangeTrade>) {
+    TRADE_MANAGER.set(manager).ok();
+}
+```
+
+### 7.2 place_order реализация:
+
+```rust
+#[no_mangle]
+pub unsafe extern "C" fn place_order(
+    api_key: *const c_char,
+    secret_key: *const c_char,
+    symbol: *const c_char,
+    price: f64,
+    quantity: f64,
+    side: *const c_char,
+    callback: OrderCallback,
+) {
+    let manager = TRADE_MANAGER.get().expect("init_trading not called");
+    
+    // Конвертируем C-строки → Rust String
+    let api_key_str = CStr::from_ptr(api_key).to_str().unwrap().to_string();
+    let secret_key_str = CStr::from_ptr(secret_key).to_str().unwrap().to_string();
+    let symbol_str = CStr::from_ptr(symbol).to_str().unwrap().to_string();
+    let side_str = CStr::from_ptr(side).to_str().unwrap().to_string();
+    
+    // Получаем tokio runtime handle (важно!)
+    let handle = tokio::runtime::Handle::try_current().unwrap();
+    
+    let manager = manager.clone();
+    
+    handle.spawn(async move {
+        manager.send_limit_order(
+            &api_key_str,
+            &secret_key_str,
+            &symbol_str,
+            price,
+            quantity,
+            &side_str,
+            move |resp: serde_json::Value| {
+                let result = if let Some(error) = resp.get("error") {
+                    OrderResult {
+                        success: false,
+                        order_id: -1,
+                        error_code: error["code"].as_i64().unwrap_or(-1) as i32,
+                    }
+                } else if let Some(order_id) = resp["result"]["orderId"].as_i64() {
+                    OrderResult {
+                        success: true,
+                        order_id,
+                        error_code: 0,
+                    }
+                } else {
+                    OrderResult {
+                        success: false,
+                        order_id: -1,
+                        error_code: -9998,
+                    }
+                };
+                
+                unsafe { callback(result); }
+            },
+        ).await;
+    });
+}
+```
+
+## 8. EXCHANGE TRADE (exchange_trade.rs)
+
+### 8.1 Структура:
+
+```rust
+pub struct ExchangeTrade {
+    ws_url: String,
+    is_connected: AtomicBool,
+    out_tx: mpsc::Sender<Outbound>,
+    ctrl_tx: mpsc::Sender<Ctrl>,
+    event_tx: broadcast::Sender<Event>,
+    pending: DashMap<String, Callback>,        // request_id → callback
+    inflight_ids: DashSet<String>,             // отправлено но не ACK
+    id_counter: AtomicU64,
+    time_offset_ms: AtomicI64,                 // sync с Binance
+}
+```
+
+### 8.2 Синхронизация времени:
+
+```rust
+pub async fn sync_time(&self) -> Result<i64> {
+    let t0 = Utc::now().timestamp_millis();
+    
+    let client = reqwest::Client::new();
+    let resp = client
+        .get("https://fapi.binance.com/fapi/v1/time")
+        .timeout(Duration::from_secs(5))
+        .send()
+        .await?;
+    
+    let t1 = Utc::now().timestamp_millis();
+    
+    let json: Value = resp.json().await?;
+    let server_time = json["serverTime"].as_i64().unwrap();
+    
+    let network_delay = t1 - t0;
+    let local_adjusted = t0 + network_delay / 2;
+    let offset = server_time - local_adjusted;
+    
+    self.time_offset_ms.store(offset, Ordering::Relaxed);
+    
+    Ok(offset)
+}
+```
+
+### 8.3 Подпись запроса (HMAC-SHA256):
+
+```rust
+fn build_message_for_cmd(&self, cmd: &Command, id: &str) -> Option<String> {
+    let local_time = Utc::now().timestamp_millis();
+    let offset = self.time_offset_ms.load(Ordering::Relaxed);
+    let timestamp = local_time + offset;
+    
+    // BTreeMap для детерминированного порядка
+    let mut params = BTreeMap::new();
+    params.insert("apiKey", api_key.clone());
+    params.insert("symbol", "SOLUSDT".to_string());
+    params.insert("price", format!("{:.2}", price));
+    params.insert("quantity", format!("{:.1}", quantity));
+    params.insert("side", "BUY".to_string());
+    params.insert("type", "LIMIT".to_string());
+    params.insert("timeInForce", "GTC".to_string());
+    params.insert("positionSide", "BOTH".to_string());
+    params.insert("timestamp", timestamp.to_string());
+    params.insert("recvWindow", "5000".to_string());
+    
+    // query string для подписи
+    let query = params.iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join("&");
+    
+    // HMAC-SHA256
+    let mut mac = HmacSha256::new_from_slice(secret_key.as_bytes())?;
+    mac.update(query.as_bytes());
+    let signature = hex::encode(mac.finalize().into_bytes());
+    
+    // JSON с signature
+    params.insert("signature", signature);
+    
+    let msg = json!({
+        "id": id,
+        "method": "order.place",
+        "params": params
+    });
+    
+    Some(msg.to_string())
+}
+```
+
+### 8.4 WebSocket loop:
+
+```rust
+async fn run_socket(&self, ws_url: String, mut out_rx: mpsc::Receiver<Outbound>, mut ctrl_rx: mpsc::Receiver<Ctrl>) {
+    let mut backlog: VecDeque<Outbound> = VecDeque::new();
+    
+    loop {
+        match connect_async(&ws_url).await {
+            Ok((ws, _)) => {
+                self.is_connected.store(true, Ordering::Relaxed);
+                let (mut write, mut read) = ws.split();
+                
+                // Reader task
+                tokio::spawn(async move {
+                    while let Ok(Some(Ok(Message::Text(txt)))) = 
+                        timeout(Duration::from_secs(30), read.next()).await 
+                    {
+                        self.handle_text(txt).await;
+                    }
+                });
+                
+                // Writer loop
+                let mut ping_tick = interval(Duration::from_secs(15));
+                
+                // Отправляем backlog
+                while let Some(msg) = backlog.pop_front() {
+                    write.send(Message::Text(msg.payload)).await?;
+                    self.inflight_ids.insert(msg.id);
+                }
+                
+                // Main loop
+                loop {
+                    select! {
+                        _ = ping_tick.tick() => {
+                            write.send(Message::Ping(Vec::new())).await?;
+                        }
+                        msg = out_rx.recv() => {
+                            if let Some(msg) = msg {
+                                write.send(Message::Text(msg.payload)).await?;
+                                self.inflight_ids.insert(msg.id);
+                            }
+                        }
+                        ctrl = ctrl_rx.recv() => {
+                            if let Some(Ctrl::Pong(data)) = ctrl {
+                                write.send(Message::Pong(data)).await?;
+                            }
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                self.is_connected.store(false, Ordering::Relaxed);
+                sleep(Duration::from_secs(2)).await;
+            }
+        }
+    }
+}
+```
+
+## 9. EXCHANGE DATA (exchange_data.rs)
+
+### 9.1 Конвертация JSON → CEvent:
+
+```rust
+async fn handle_text(&self, mut txt: String) {
+    let received_at_ns = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as u64;
+    
+    if txt.contains("\"bookTicker\"") {
+        match unsafe { simd_json::from_str::<RawBookTicker>(txt.as_mut_str()) } {
+            Ok(bt) => {
+                // Копируем symbol в [u8; 16]
+                let mut symbol = [0u8; 16];
+                let bytes = bt.symbol.as_bytes();
+                let len = bytes.len().min(15);
+                symbol[..len].copy_from_slice(&bytes[..len]);
+                
+                let c_event = CEvent {
+                    event_type: 0,
+                    data: CEventData {
+                        book_ticker: CBookTicker {
+                            symbol,
+                            symbol_len: len as u8,
+                            bid_price: bt.bid_price.parse().unwrap_or(0.0),
+                            ask_price: bt.ask_price.parse().unwrap_or(0.0),
+                            bid_qty: bt.bid_qty.parse().unwrap_or(0.0),
+                            ask_qty: bt.ask_qty.parse().unwrap_or(0.0),
+                            time: bt.time,
+                        }
+                    },
+                    received_at_ns,
+                };
+                
+                let _ = self.event_tx.send(c_event);
+            }
+            Err(e) => tracing::error!("Parse error: {}", e),
+        }
+    }
+    
+    // Аналогично для Trade
+}
+```
+
+## 10. API ENDPOINTS
+
+### 10.1 Market Data:
+- POST /subscribe/bookticker - {"ticker": "solusdt"}
+- POST /unsubscribe/bookticker
+- POST /subscribe/trades
+- POST /unsubscribe/trades
+
+### 10.2 Trading:
+- POST /order/test - {api_key, secret_key, symbol, price, quantity, side}
+- POST /order/cancel - {api_key, secret_key, symbol, order_id}
+
+### 10.3 Strategies CRUD:
+- POST /strategies - {id, name, symbol, code}
+- GET /strategies - список всех
+- GET /strategies/:id - получить одну
+- DELETE /strategies/:id
+- PUT /strategies/:id/code - {code}
+- PUT /strategies/:id/metadata - {name?, symbol?, enabled?, open_positions?}
+- POST /strategies/:id/compile
+- POST /strategies/:id/check
+
+### 10.4 Strategies Runtime:
+- POST /strategies/:id/start
+- POST /strategies/:id/stop
+- GET /strategies/running
+
+## 11. MAIN.RS
+
+### 11.1 AppContext:
+
+```rust
+#[derive(Clone)]
+struct AppContext {
+    data_manager: Arc<ExchangeData>,
+    trade_manager: Arc<ExchangeTrade>,
+    event_broadcaster: broadcast::Sender<CEvent>,
+}
+```
+
+### 11.2 Инициализация:
+
+```rust
+#[tokio::main]
+async fn main() {
+    tracing_subscriber::fmt().compact().init();
+    
+    let (event_tx, _) = broadcast::channel::<CEvent>(10000);
+    
+    let data_manager = ExchangeData::new(
+        "wss://fstream.binance.com/ws".to_string(),
+        event_tx.clone()
+    );
+    
+    let trade_manager = ExchangeTrade::new(
+        "wss://ws-fapi.binance.com/ws-fapi/v1".to_string()
+    );
+    
+    // Синхронизация времени
+    match trade_manager.sync_time().await {
+        Ok(offset) => {
+            if offset.abs() > 1000 {
+                tracing::warn!("Large offset: {}ms", offset);
+            } else {
+                tracing::info!("Time offset: {}ms", offset);
+            }
+        }
+        Err(e) => {
+            tracing::error!("Time sync failed: {}", e);
+            trade_manager.set_time_offset(-1000);
+        }
+    }
+    
+    // ВАЖНО: инициализируем глобальный TRADE_MANAGER
+    crate::strategies::order::init_trading(trade_manager.clone());
+    
+    let app_state = Arc::new(AppContext {
+        data_manager,
+        trade_manager,
+        event_broadcaster: event_tx.clone(),
+    });
+    
+    let strategy_storage = Arc::new(
+        StrategyStorage::new("./strategies/db").unwrap()
+    );
+    
+    let strategy_runner = StrategyRunner::new();
+    
+    let app = Router::new()
+        .route("/subscribe/bookticker", post(subscribe_bookticker))
+        .route("/order/test", post(test_order))
+        .with_state(app_state.clone())
+        .merge(strategy::strategy_routes(strategy_storage.clone()))
+        .merge(strategy::runtime_routes(strategy_storage, strategy_runner, event_tx));
+    
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await.unwrap();
+    tracing::info!("🚀 Server running on http://0.0.0.0:8080");
+    axum::serve(listener, app).await.unwrap();
+}
+```
+
+## 12. ПРИМЕРЫ ИСПОЛЬЗОВАНИЯ
+
+### 12.1 Создание стратегии через API:
+
+```bash
+curl -X POST http://localhost:8080/strategies \
+  -H "Content-Type: application/json" \
+  -d '{
+    "id": "sol_buyer",
+    "name": "SOL Buyer",
+    "symbol": "SOLUSDT",
+    "code": "use crossbeam::channel::Receiver;\nuse std::sync::atomic::{AtomicBool, Ordering};\nuse std::time::{Instant, Duration};\nuse std::ffi::CString;\n\nstatic STOP_FLAG: AtomicBool = AtomicBool::new(false);\n\nstruct Strategy {\n    orders_sent: u64,\n    last_order_time: Instant,\n}\n\nimpl Strategy {\n    fn new() -> Self {\n        Self {\n            orders_sent: 0,\n            last_order_time: Instant::now(),\n        }\n    }\n    \n    fn should_place_order(&self) -> bool {\n        self.last_order_time.elapsed() >= Duration::from_secs(20)\n    }\n}\n\nunsafe extern \"C\" fn order_callback(result: OrderResult) {\n    if result.success {\n        println!(\"✅ Order ID: {}\", result.order_id);\n    } else {\n        println!(\"❌ Error: {}\", result.error_code);\n    }\n}\n\n#[no_mangle]\npub extern \"C\" fn run(\n    rx_ptr: *mut Receiver<CEvent>,\n    place_order: PlaceOrderFn,\n    _cancel_order: CancelOrderFn,\n) -> i32 {\n    let rx = unsafe { &*rx_ptr };\n    let mut strategy = Strategy::new();\n    \n    let api_key = CString::new(\"YOUR_KEY\").unwrap();\n    let secret_key = CString::new(\"YOUR_SECRET\").unwrap();\n    let symbol = CString::new(\"SOLUSDT\").unwrap();\n    let side = CString::new(\"BUY\").unwrap();\n    \n    while !STOP_FLAG.load(Ordering::Relaxed) {\n        match rx.recv_timeout(Duration::from_millis(100)) {\n            Ok(_) => {\n                if strategy.should_place_order() {\n                    unsafe {\n                        place_order(\n                            api_key.as_ptr(),\n                            secret_key.as_ptr(),\n                            symbol.as_ptr(),\n                            127.0,\n                            1.0,\n                            side.as_ptr(),\n                            order_callback,\n                        );\n                    }\n                    strategy.orders_sent += 1;\n                    strategy.last_order_time = Instant::now();\n                }\n            }\n            Err(crossbeam::channel::RecvTimeoutError::Timeout) => continue,\n            Err(_) => break,\n        }\n    }\n    0\n}\n\n#[no_mangle]\npub extern \"C\" fn stop() {\n    STOP_FLAG.store(true, Ordering::Relaxed);\n}"
+  }'
+```
+
+### 12.2 Workflow запуска стратегии:
+
+```bash
+# 1. Подписаться на данные
+curl -X POST http://localhost:8080/subscribe/bookticker \
+  -H "Content-Type: application/json" \
+  -d '{"ticker":"solusdt"}'
+
+# 2. Создать стратегию (см. выше)
+
+# 3. Запустить стратегию
+curl -X POST http://localhost:8080/strategies/sol_buyer/start
+
+# 4. Проверить что работает
+curl http://localhost:8080/strategies/running
+
+# 5. Остановить
+curl -X POST http://localhost:8080/strategies/sol_buyer/stop
+```
+
+## 13. ВАЖНЫЕ ДЕТАЛИ
+
+### 13.1 Binance Futures параметры (SOLUSDT):
+- tickSize (цена): 0.01
+- stepSize (количество): 1.0
+- minQty: 1.0
+- Округление: (value / tick_size).round() * tick_size
+
+### 13.2 API ключи (testnet):
+```
+API_KEY: ay0LdRfUbErVi6jTAanIjiuASqId3oLQYibIwCRQY3OLKiKdHCVGvLQgtH9X5wWm
+SECRET: 3AJ2HfjBkNPKwfsPswkzAkqVx6Jawm3xSQTOMKJ1ib5e4Wa9DEM5ddvfhDjeqPO4
+```
+
+### 13.3 Паттерны в коде:
+
+**Arc<Mutex<Option<oneshot::Sender>>>** - для callback→async:
+```rust
+let tx = Arc::new(Mutex::new(Some(tx)));
+let tx_clone = tx.clone();
+tokio::spawn(async move {
+    if let Some(sender) = tx_clone.lock().await.take() {
+        sender.send(data).ok();
+    }
+});
+```
+
+**DashMap vs HashMap** - thread-safe без Mutex
+**AtomicBool для STOP_FLAG** - безопасная остановка из другого потока
+**recv_timeout(100ms)** - позволяет проверять STOP_FLAG регулярно
+
+### 13.4 Оптимизации:
+- simd_json (unsafe) вместо serde_json
+- ryu::Buffer для f64→string без аллокаций
+- BTreeMap для детерминированного порядка параметров
+- Stack allocation для symbol [u8; 16] вместо String
+- SharedStr = Arc<String> для избежания клонирования payload
+
+---
+
+Теперь ты полностью в контексте проекта. Можно начинать работу!
+```

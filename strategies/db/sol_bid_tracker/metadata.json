@@ -1,0 +1,9 @@
+{
+  "id": "sol_bid_tracker",
+  "name": "SOL Bid Changes Tracker",
+  "symbol": "SOLUSDT",
+  "enabled": false,
+  "open_positions": true,
+  "created_at": 1763975617,
+  "updated_at": 1763975617
+}
