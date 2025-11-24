@@ -7,13 +7,13 @@ use axum::{
     Router,
 };
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::sync::Arc;
 use tokio::sync::broadcast;
 
 use crate::strategies::storage::{StrategyStorage, Strategy, StrategyMetadata};
 use crate::strategies::manager::StrategyRunner;
 use crate::ffi_types::CEvent;
-// use crate::exchange_data::Event;
 
 // ═══════════════════════════════════════════════════════════
 // REQUEST/RESPONSE ТИПЫ
@@ -38,6 +38,12 @@ pub struct UpdateMetadataRequest {
     pub symbol: Option<String>,
     pub enabled: Option<bool>,
     pub open_positions: Option<bool>,
+}
+
+#[derive(Deserialize)]
+pub struct StartInstanceRequest {
+    pub symbol: String,
+    pub params: Option<Value>,  // JSON объект с параметрами
 }
 
 #[derive(Serialize)]
@@ -110,9 +116,16 @@ pub fn runtime_routes(
     event_tx: broadcast::Sender<CEvent>,
 ) -> Router {
     Router::new()
+        // Новый API (с instances)
+        .route("/strategies/:id/instances/:symbol/start", post(start_instance))
+        .route("/instances/:instance_id/stop", post(stop_instance))
+        .route("/instances/running", get(list_running_instances))
+        
+        // Старый API (обратная совместимость)
         .route("/strategies/:id/start", post(start_strategy))
         .route("/strategies/:id/stop", post(stop_strategy))
         .route("/strategies/running", get(list_running))
+        
         .with_state((storage, runner, event_tx))
 }
 
@@ -470,13 +483,14 @@ async fn check_strategy(
 }
 
 // ═══════════════════════════════════════════════════════════
-// RUNTIME: ЗАПУСК И ОСТАНОВКА СТРАТЕГИЙ
+// RUNTIME: ЗАПУСК И ОСТАНОВКА (НОВЫЙ API С INSTANCES)
 // ═══════════════════════════════════════════════════════════
 
-/// POST /strategies/:id/start - запустить стратегию
-async fn start_strategy(
+/// POST /strategies/:id/instances/:symbol/start - запустить instance на конкретной монете
+async fn start_instance(
     State((storage, runner, event_tx)): State<RuntimeState>,
-    Path(id): Path<String>,
+    Path((id, symbol)): Path<(String, String)>,
+    Json(req): Json<StartInstanceRequest>,
 ) -> (StatusCode, Json<ApiResponse>) {
     // Проверяем что стратегия существует
     if storage.load(&id).is_err() {
@@ -525,18 +539,33 @@ async fn start_strategy(
         }
     };
     
-    // Запускаем стратегию с event receiver
+    // Конвертируем параметры в JSON строку
+    let params_json = match req.params {
+        Some(p) => serde_json::to_string(&p).unwrap_or_else(|_| "{}".to_string()),
+        None => "{}".to_string(),
+    };
+    
+    // Формируем instance_id
+    let instance_id = format!("{}:{}", id, symbol.to_uppercase());
+    
+    // Запускаем instance с параметрами
     match runner.start(
-        id.clone(),
+        instance_id.clone(),
         lib_path,
-        event_tx.subscribe(),  // ← ЗДЕСЬ передаём receiver!
+        event_tx.subscribe(),
+        symbol.clone(),
+        params_json,
     ).await {
         Ok(_) => (
             StatusCode::OK,
             Json(ApiResponse {
                 success: true,
-                message: format!("Strategy '{}' started", id),
-                data: None,
+                message: format!("Instance '{}' started", instance_id),
+                data: Some(serde_json::json!({
+                    "instance_id": instance_id,
+                    "strategy_id": id,
+                    "symbol": symbol,
+                })),
             }),
         ),
         Err(e) => (
@@ -550,17 +579,17 @@ async fn start_strategy(
     }
 }
 
-/// POST /strategies/:id/stop - остановить стратегию
-async fn stop_strategy(
+/// POST /instances/:instance_id/stop - остановить конкретный instance
+async fn stop_instance(
     State((_storage, runner, _event_tx)): State<RuntimeState>,
-    Path(id): Path<String>,
+    Path(instance_id): Path<String>,
 ) -> (StatusCode, Json<ApiResponse>) {
-    match runner.stop(&id).await {
+    match runner.stop(&instance_id).await {
         Ok(_) => (
             StatusCode::OK,
             Json(ApiResponse {
                 success: true,
-                message: format!("Strategy '{}' stopped", id),
+                message: format!("Instance '{}' stopped", instance_id),
                 data: None,
             }),
         ),
@@ -575,9 +604,85 @@ async fn stop_strategy(
     }
 }
 
-/// GET /strategies/running - список запущенных стратегий
+/// GET /instances/running - список всех запущенных instances
+async fn list_running_instances(
+    State((_storage, runner, _event_tx)): State<RuntimeState>,
+) -> Json<Vec<String>> {
+    Json(runner.list_running())
+}
+
+// ═══════════════════════════════════════════════════════════
+// RUNTIME: СТАРЫЙ API (ОБРАТНАЯ СОВМЕСТИМОСТЬ)
+// ═══════════════════════════════════════════════════════════
+
+/// POST /strategies/:id/start - запустить стратегию (старый API)
+/// Использует symbol из metadata, без дополнительных параметров
+async fn start_strategy(
+    State((storage, runner, event_tx)): State<RuntimeState>,
+    Path(id): Path<String>,
+) -> (StatusCode, Json<ApiResponse>) {
+    // Загружаем стратегию чтобы получить symbol из metadata
+    let strategy = match storage.load(&id) {
+        Ok(s) => s,
+        Err(_) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(ApiResponse {
+                    success: false,
+                    message: format!("Strategy '{}' not found", id),
+                    data: None,
+                }),
+            );
+        }
+    };
+    
+    let symbol = strategy.metadata.symbol;
+    
+    // Используем новый метод с пустыми параметрами
+    let req = StartInstanceRequest {
+        symbol: symbol.clone(),
+        params: None,
+    };
+    
+    start_instance(
+        State((storage, runner, event_tx)),
+        Path((id, symbol)),
+        Json(req),
+    ).await
+}
+
+/// POST /strategies/:id/stop - остановить стратегию (старый API)
+async fn stop_strategy(
+    State((storage, runner, _event_tx)): State<RuntimeState>,
+    Path(id): Path<String>,
+) -> (StatusCode, Json<ApiResponse>) {
+    // Загружаем стратегию чтобы получить symbol
+    let strategy = match storage.load(&id) {
+        Ok(s) => s,
+        Err(_) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(ApiResponse {
+                    success: false,
+                    message: format!("Strategy '{}' not found", id),
+                    data: None,
+                }),
+            );
+        }
+    };
+    
+    let instance_id = format!("{}:{}", id, strategy.metadata.symbol.to_uppercase());
+    
+    stop_instance(
+        State((storage, runner, broadcast::channel(1).0)),
+        Path(instance_id),
+    ).await
+}
+
+/// GET /strategies/running - список запущенных стратегий (старый API)
 async fn list_running(
     State((_storage, runner, _event_tx)): State<RuntimeState>,
 ) -> Json<Vec<String>> {
+    // Возвращаем все instances (для совместимости)
     Json(runner.list_running())
 }

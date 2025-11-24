@@ -1,73 +1,74 @@
-// src/strategies/runner.rs
+// src/strategies/manager.rs
 
 use libloading::Library;
-use tokio::sync::broadcast; // Для динамической загрузки библиотек (.so, .dll).
-use std::path::PathBuf; // Для работы с путями файловой системы.
-use std::sync::Arc; // Atomic Reference Counter - умный указатель для многопоточности.
-// use std::sync::atomic::{AtomicBool, Ordering}; // AtomicBool: Булево значение которое можно безопасно менять из разных потоков.
-use tokio::task::JoinHandle; // Handle на запущенный async task, через него можем дождаться завершения.
-use dashmap::DashMap; // Thread-safe HashMap (можно читать/писать из разных потоков одновременно).
+use tokio::sync::broadcast;
+use std::path::PathBuf;
+use std::sync::Arc;
+use tokio::task::JoinHandle;
+use dashmap::DashMap;
 use anyhow::Result;
 use crossbeam::channel::{bounded, Receiver};
 use crate::ffi_types::CEvent;
-use std::os::raw::c_char;
+use std::ffi::CString;
+
 use crate::strategies::order::{
-    OrderResult, 
-    OrderCallback, 
-    PlaceOrderFn,
-    CancelOrderFn,
-    place_order,
-    cancel_order,
+    OrderResult, OrderCallback, PlaceOrderFn, CancelOrderFn,
+    place_order, cancel_order,
 };
 
+// ═══════════════════════════════════════════════════════════
+// КОНФИГ С JSON ПАРАМЕТРАМИ
+// ═══════════════════════════════════════════════════════════
 
-
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct StrategyConfig {
+    pub symbol: [u8; 16],
+    pub symbol_len: u8,
+    pub params_json: *const std::os::raw::c_char,
+}
 
 type RunFn = unsafe extern "C" fn(
-    rx: *mut Receiver<CEvent>, 
-    place_order: PlaceOrderFn,    // ← добавили
-    cancel_order: CancelOrderFn, ) -> i32;
-type StopFn = unsafe extern "C" fn();
-// Разбор:
-// extern "C" - функция использует C calling convention (совместимо с FFI)
-// fn() -> i32 - функция без аргументов, возвращает int
-// unsafe - вызов требует unsafe блок
+    rx: *mut Receiver<CEvent>,
+    place_order: PlaceOrderFn,
+    cancel_order: CancelOrderFn,
+    config: StrategyConfig,
+) -> i32;
 
+type StopFn = unsafe extern "C" fn();
 
 pub struct StrategyRunner {
     running: DashMap<String, RunningStrategy>,
 }
-// Что хранит: Карту "ID стратегии" → "Информация о запущенной стратегии".
-// Обращения к этой области памяти будут приходить из разных потоков, поэтому используем DashMap. Thread-safe хранилище
 
 struct RunningStrategy {
-    _lib: Arc<Library>, // Держим библиотеку в памяти пока стратегия запущена. В arc чтобы можно было клонировать в поток.
-    stop_fn: StopFn, // Флаг остановки стратегии. Прокидывается в стратегию извне. В атомике чтобы было доступно извне.
-    task: JoinHandle<()>, // Хэндл на задачу, чтобы можно было дождаться её завершения.
-    bridge_task: JoinHandle<()>,  // ← новое поле для bridge
+    _lib: Arc<Library>,
+    stop_fn: StopFn,
+    task: JoinHandle<()>,
+    bridge_task: JoinHandle<()>,
 }
-// Инфа о запущенной стратегии
 
 impl StrategyRunner {
     pub fn new() -> Arc<Self> {
-        // Создаем новый экземпляр StrategyRunner с пустой DashMap
         Arc::new(Self {
             running: DashMap::new(),
         })
     }
     
-
     pub async fn start(
         &self,
-        strategy_id: String,
+        instance_id: String,
         lib_path: PathBuf,
         mut event_rx: broadcast::Receiver<CEvent>,
+        symbol: String,
+        params_json: String,  // ← String, не указатель
     ) -> Result<()> {
-        if self.running.contains_key(&strategy_id) {
-            anyhow::bail!("Strategy '{}' is already running", strategy_id);
+        if self.running.contains_key(&instance_id) {
+            anyhow::bail!("Instance '{}' is already running", instance_id);
         }
         
-        tracing::info!("📦 Loading library: {:?}", lib_path);
+        tracing::info!("📦 Loading library for instance '{}' with params: {}", 
+                       instance_id, params_json);
         
         let lib: Arc<Library> = Arc::new(unsafe { 
             Library::new(&lib_path)?
@@ -76,7 +77,7 @@ impl StrategyRunner {
         let (sync_tx, sync_rx) = bounded::<CEvent>(8192);
         
         // Bridge task
-        let strategy_id_clone = strategy_id.clone();
+        let instance_id_clone = instance_id.clone();
         let bridge_task = tokio::spawn(async move {
             let mut dropped = 0;
             
@@ -87,8 +88,8 @@ impl StrategyRunner {
                         dropped += 1;
                         if dropped % 1000 == 0 {
                             tracing::warn!(
-                                "⚠️ Strategy '{}' lagging: {} dropped",
-                                strategy_id_clone,
+                                "⚠️ Instance '{}' lagging: {} dropped",
+                                instance_id_clone,
                                 dropped
                             );
                         }
@@ -110,92 +111,92 @@ impl StrategyRunner {
         };
         
         let lib_clone = lib.clone();
-        let strategy_id_clone = strategy_id.clone();
+        let instance_id_clone = instance_id.clone();
         
         // ═══════════════════════════════════════════════════════════
-        // ИСПРАВЛЕНИЕ: передаём SAM Receiver, а не указатель!
+        // ИСПРАВЛЕНИЕ: передаём String, CString создаём ВНУТРИ blocking thread
         // ═══════════════════════════════════════════════════════════
         
         let task = tokio::task::spawn_blocking(move || {
-            tracing::info!("🚀 Calling run() for '{}'...", strategy_id_clone);
+            tracing::info!("🚀 Starting instance '{}'...", instance_id_clone);
             
-            // Создаём указатель ЗДЕСЬ, внутри потока
+            // Создаём CString ЗДЕСЬ, внутри blocking thread
+            let params_cstring = CString::new(params_json)
+                .expect("Invalid JSON string");
+            
+            // Подготовка symbol
+            let mut symbol_bytes = [0u8; 16];
+            let bytes = symbol.as_bytes();
+            let len = bytes.len().min(15);
+            symbol_bytes[..len].copy_from_slice(&bytes[..len]);
+            
+            // Создаём конфиг с указателем на CString
+            let config = StrategyConfig {
+                symbol: symbol_bytes,
+                symbol_len: len as u8,
+                params_json: params_cstring.as_ptr(),
+            };
+            
             let rx_ptr = Box::into_raw(Box::new(sync_rx));
             
             // Вызываем функцию стратегии
             let result = unsafe { 
-                    run_fn(
-                        rx_ptr,
-                        place_order,
-                        cancel_order,
-                    )
-                 };
+                run_fn(
+                    rx_ptr,
+                    place_order,
+                    cancel_order,
+                    config,
+                )
+            };
             
-            tracing::info!("✅ run() returned {} for '{}'", result, strategy_id_clone);
+            tracing::info!("✅ Instance '{}' exited with code {}", instance_id_clone, result);
             
             // Очищаем память
             unsafe { 
                 let _ = Box::from_raw(rx_ptr); 
             }
             
+            // params_cstring дропнется автоматически здесь
             drop(lib_clone);
         });
         
-        self.running.insert(strategy_id.clone(), RunningStrategy {
+        self.running.insert(instance_id.clone(), RunningStrategy {
             _lib: lib,
             stop_fn,
             task,
             bridge_task,
         });
         
-        tracing::info!("✅ Strategy '{}' started", strategy_id);
+        tracing::info!("✅ Instance '{}' started", instance_id);
         Ok(())
     }
-    /// Остановить стратегию
-    /// 
-    /// # Аргументы
-    /// * `strategy_id` - ID стратегии для остановки
-    pub async fn stop(&self, strategy_id: &str) -> Result<()> {
-        // Удаляем из карты запущенных
-        let (_, running) = self.running.remove(strategy_id)
-            .ok_or_else(|| anyhow::anyhow!("Strategy '{}' not running", strategy_id))?;
+    
+    pub async fn stop(&self, instance_id: &str) -> Result<()> {
+        let (_, running) = self.running.remove(instance_id)
+            .ok_or_else(|| anyhow::anyhow!("Instance '{}' not running", instance_id))?;
         
-        tracing::info!("🛑 Stopping strategy '{}'...", strategy_id);
+        tracing::info!("🛑 Stopping instance '{}'...", instance_id);
         
-        // ═══════════════════════════════════════════════════════════
-        // 1. Вызываем stop() из DLL
-        // ═══════════════════════════════════════════════════════════
-        
-        tracing::debug!("Calling stop() function from DLL...");
         unsafe {
             (running.stop_fn)();
         }
         
-        // ═══════════════════════════════════════════════════════════
-        // 2. Останавливаем bridge task
-        // ═══════════════════════════════════════════════════════════
-        
         running.bridge_task.abort();
-        
-        // ═══════════════════════════════════════════════════════════
-        // 3. Ждём завершения стратегии (с таймаутом)
-        // ═══════════════════════════════════════════════════════════
         
         match tokio::time::timeout(
             tokio::time::Duration::from_secs(5),
             running.task
         ).await {
             Ok(Ok(())) => {
-                tracing::info!("✅ Strategy '{}' stopped cleanly", strategy_id);
+                tracing::info!("✅ Instance '{}' stopped cleanly", instance_id);
                 Ok(())
             }
             Ok(Err(e)) => {
-                tracing::error!("❌ Strategy '{}' task panicked: {:?}", strategy_id, e);
-                anyhow::bail!("Strategy task panicked: {:?}", e)
+                tracing::error!("❌ Instance '{}' task panicked: {:?}", instance_id, e);
+                anyhow::bail!("Instance task panicked: {:?}", e)
             }
             Err(_) => {
-                tracing::warn!("⚠️ Strategy '{}' didn't stop in 5s (might be hanging)", strategy_id);
-                // Не возвращаем ошибку - библиотека уже unloaded
+                tracing::warn!("⚠️ Instance '{}' didn't stop in 5s", instance_id);
                 Ok(())
             }
         }
@@ -205,7 +206,7 @@ impl StrategyRunner {
         self.running.iter().map(|e| e.key().clone()).collect()
     }
     
-    pub fn is_running(&self, strategy_id: &str) -> bool {
-        self.running.contains_key(strategy_id)
+    pub fn is_running(&self, instance_id: &str) -> bool {
+        self.running.contains_key(instance_id)
     }
 }

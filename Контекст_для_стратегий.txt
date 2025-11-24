@@ -1,0 +1,616 @@
+```
+# Разработка стратегий для HFT Trading Core
+
+Я пишу торговые стратегии на Rust, которые компилируются в cdylib и загружаются динамически в торговое ядро.
+
+## 1. СТРУКТУРА СТРАТЕГИИ
+
+### 1.1 Обязательные элементы:
+
+```rust
+use crossbeam::channel::Receiver;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
+use std::ffi::CString;
+
+// Глобальный флаг остановки
+static STOP_FLAG: AtomicBool = AtomicBool::new(false);
+
+// Обязательная функция: точка входа
+#[no_mangle]
+pub extern "C" fn run(
+    rx_ptr: *mut Receiver<CEvent>,    // Канал событий
+    place_order: PlaceOrderFn,        // Функция для отправки ордеров
+    cancel_order: CancelOrderFn,      // Функция для отмены ордеров
+) -> i32 {
+    // Логика стратегии
+    0  // Код возврата
+}
+
+// Обязательная функция: остановка
+#[no_mangle]
+pub extern "C" fn stop() {
+    STOP_FLAG.store(true, Ordering::Relaxed);
+}
+```
+
+### 1.2 Что НЕ НУЖНО писать (автоматически добавляется):
+
+- `mod types; use types::*;` - добавляется автоматически
+- Весь файл `types.rs` - копируется из шаблона
+- `Cargo.toml` - генерируется автоматически
+
+## 2. ДОСТУПНЫЕ ТИПЫ
+
+### 2.1 События:
+
+```rust
+// Приходят через rx.recv()
+struct CEvent {
+    event_type: u8,         // 0 = BookTicker, 1 = Trade
+    data: CEventData,       // union
+    received_at_ns: u64,    // timestamp получения
+}
+
+union CEventData {
+    book_ticker: CBookTicker,
+    trade: CTrade,
+}
+```
+
+### 2.2 BookTicker (лучшие bid/ask):
+
+```rust
+struct CBookTicker {
+    symbol: [u8; 16],       // фиксированный массив
+    symbol_len: u8,         // реальная длина
+    bid_price: f64,         // лучшая цена покупки
+    ask_price: f64,         // лучшая цена продажи
+    bid_qty: f64,           // объём на bid
+    ask_qty: f64,           // объём на ask
+    time: i64,              // exchange timestamp
+}
+
+// Хелпер для получения символа как строки
+impl CBookTicker {
+    pub fn symbol_str(&self) -> &str;
+}
+
+// Использование:
+let bt = unsafe { &event.data.book_ticker };
+if bt.symbol_str() == "solusdt" {
+    println!("Bid: {:.2}, Ask: {:.2}", bt.bid_price, bt.ask_price);
+}
+```
+
+### 2.3 Trade (исполненные сделки):
+
+```rust
+struct CTrade {
+    symbol: [u8; 16],
+    symbol_len: u8,
+    price: f64,             // цена сделки
+    qty: f64,               // ОТРИЦАТЕЛЬНЫЙ если maker sell
+    time: i64,
+}
+
+// Использование:
+let trade = unsafe { &event.data.trade };
+let side = if trade.qty > 0.0 { "BUY" } else { "SELL" };
+println!("{} {} @ {:.2}", side, trade.qty.abs(), trade.price);
+```
+
+### 2.4 Ордера:
+
+```rust
+struct OrderResult {
+    success: bool,          // true если ордер создан
+    order_id: i64,          // ID ордера или -1
+    error_code: i32,        // Binance error code или 0
+}
+
+// Callback вызывается асинхронно при ответе от биржи
+type OrderCallback = unsafe extern "C" fn(result: OrderResult);
+
+// Функция отправки ордера
+type PlaceOrderFn = unsafe extern "C" fn(
+    api_key: *const c_char,
+    secret_key: *const c_char,
+    symbol: *const c_char,
+    price: f64,
+    quantity: f64,
+    side: *const c_char,    // "BUY" или "SELL"
+    callback: OrderCallback,
+);
+```
+
+## 3. ОСНОВНЫЕ ПАТТЕРНЫ
+
+### 3.1 Минимальная стратегия (каркас):
+
+```rust
+use crossbeam::channel::Receiver;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
+use std::ffi::CString;
+
+static STOP_FLAG: AtomicBool = AtomicBool::new(false);
+
+struct Strategy {
+    // Ваши поля
+}
+
+impl Strategy {
+    fn new() -> Self {
+        Self { /* ... */ }
+    }
+    
+    fn on_book_ticker(&mut self, bt: &CBookTicker) {
+        // Обработка BookTicker
+    }
+    
+    fn on_trade(&mut self, trade: &CTrade) {
+        // Обработка Trade
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn run(
+    rx_ptr: *mut Receiver<CEvent>,
+    place_order: PlaceOrderFn,
+    cancel_order: CancelOrderFn,
+) -> i32 {
+    let rx = unsafe { &*rx_ptr };
+    let mut strategy = Strategy::new();
+    
+    while !STOP_FLAG.load(Ordering::Relaxed) {
+        match rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(event) => {
+                match event.event_type {
+                    0 => strategy.on_book_ticker(unsafe { &event.data.book_ticker }),
+                    1 => strategy.on_trade(unsafe { &event.data.trade }),
+                    _ => {}
+                }
+            }
+            Err(crossbeam::channel::RecvTimeoutError::Timeout) => continue,
+            Err(_) => break,
+        }
+    }
+    0
+}
+
+#[no_mangle]
+pub extern "C" fn stop() {
+    STOP_FLAG.store(true, Ordering::Relaxed);
+}
+```
+
+### 3.2 Отправка ордера:
+
+```rust
+// Подготовка данных (делаем один раз)
+let api_key = CString::new("YOUR_API_KEY").unwrap();
+let secret_key = CString::new("YOUR_SECRET").unwrap();
+let symbol = CString::new("SOLUSDT").unwrap();
+let side_buy = CString::new("BUY").unwrap();
+
+// Callback для обработки результата
+unsafe extern "C" fn order_callback(result: OrderResult) {
+    if result.success {
+        println!("✅ Order placed! ID: {}", result.order_id);
+    } else {
+        println!("❌ Order failed! Error: {}", result.error_code);
+    }
+}
+
+// Отправка ордера
+unsafe {
+    place_order(
+        api_key.as_ptr(),
+        secret_key.as_ptr(),
+        symbol.as_ptr(),
+        127.50,              // цена
+        1.0,                 // количество
+        side_buy.as_ptr(),
+        order_callback,      // будет вызван асинхронно
+    );
+}
+```
+
+### 3.3 Фильтрация по символу:
+
+```rust
+fn on_book_ticker(&mut self, bt: &CBookTicker) {
+    // Сравнение без учёта регистра
+    if !bt.symbol_str().eq_ignore_ascii_case("solusdt") {
+        return;  // игнорируем другие символы
+    }
+    
+    // Работаем только с SOLUSDT
+    println!("SOL bid: {:.2}", bt.bid_price);
+}
+```
+
+### 3.4 Отслеживание изменений:
+
+```rust
+struct Strategy {
+    last_bid: f64,
+    changes_count: u64,
+}
+
+impl Strategy {
+    fn on_book_ticker(&mut self, bt: &CBookTicker) -> bool {
+        if bt.symbol_str().eq_ignore_ascii_case("solusdt") {
+            // Проверяем изменение
+            if bt.bid_price != self.last_bid && self.last_bid != 0.0 {
+                self.changes_count += 1;
+                self.last_bid = bt.bid_price;
+                return true;  // было изменение
+            }
+            self.last_bid = bt.bid_price;
+        }
+        false
+    }
+}
+```
+
+### 3.5 Таймер (выполнять каждые N секунд):
+
+```rust
+use std::time::Instant;
+
+struct Strategy {
+    last_action_time: Instant,
+}
+
+impl Strategy {
+    fn should_act(&self) -> bool {
+        self.last_action_time.elapsed() >= Duration::from_secs(20)
+    }
+    
+    fn reset_timer(&mut self) {
+        self.last_action_time = Instant::now();
+    }
+}
+
+// В main loop:
+if strategy.should_act() {
+    // Выполняем действие
+    unsafe { place_order(...); }
+    strategy.reset_timer();
+}
+```
+
+### 3.6 Счётчик событий:
+
+```rust
+struct Strategy {
+    events_count: u64,
+}
+
+fn on_book_ticker(&mut self, bt: &CBookTicker) {
+    self.events_count += 1;
+    
+    // Каждые 100 событий
+    if self.events_count % 100 == 0 {
+        println!("Processed {} events", self.events_count);
+    }
+}
+```
+
+## 4. ЧАСТЫЕ ЗАДАЧИ
+
+### 4.1 Ордер каждые N секунд:
+
+```rust
+struct Strategy {
+    last_order_time: Instant,
+    orders_sent: u64,
+}
+
+impl Strategy {
+    fn new() -> Self {
+        Self {
+            last_order_time: Instant::now(),
+            orders_sent: 0,
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn run(rx_ptr: *mut Receiver<CEvent>, place_order: PlaceOrderFn, ...) -> i32 {
+    let rx = unsafe { &*rx_ptr };
+    let mut strategy = Strategy::new();
+    
+    let api_key = CString::new("KEY").unwrap();
+    let secret_key = CString::new("SECRET").unwrap();
+    let symbol = CString::new("SOLUSDT").unwrap();
+    let side = CString::new("BUY").unwrap();
+    
+    while !STOP_FLAG.load(Ordering::Relaxed) {
+        match rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(_) => {
+                // Проверяем таймер
+                if strategy.last_order_time.elapsed() >= Duration::from_secs(20) {
+                    unsafe {
+                        place_order(
+                            api_key.as_ptr(),
+                            secret_key.as_ptr(),
+                            symbol.as_ptr(),
+                            127.0,
+                            1.0,
+                            side.as_ptr(),
+                            |result| {
+                                if result.success {
+                                    println!("✅ Order: {}", result.order_id);
+                                }
+                            },
+                        );
+                    }
+                    strategy.orders_sent += 1;
+                    strategy.last_order_time = Instant::now();
+                }
+            }
+            Err(crossbeam::channel::RecvTimeoutError::Timeout) => continue,
+            Err(_) => break,
+        }
+    }
+    0
+}
+```
+
+### 4.2 Ордер на N изменений цены:
+
+```rust
+struct Strategy {
+    last_bid: f64,
+    changes_count: u64,
+}
+
+fn on_book_ticker(&mut self, bt: &CBookTicker) -> bool {
+    if bt.symbol_str().eq_ignore_ascii_case("solusdt") {
+        if bt.bid_price != self.last_bid && self.last_bid != 0.0 {
+            self.changes_count += 1;
+            
+            if self.changes_count % 100 == 0 {
+                self.last_bid = bt.bid_price;
+                return true;  // сигнал на ордер
+            }
+        }
+        self.last_bid = bt.bid_price;
+    }
+    false
+}
+
+// В main loop:
+if event.event_type == 0 {
+    let bt = unsafe { &event.data.book_ticker };
+    if strategy.on_book_ticker(bt) {
+        // Отправить ордер
+    }
+}
+```
+
+### 4.3 Ордер на % от текущей цены:
+
+```rust
+fn get_order_price(current_bid: f64, offset_percent: f64) -> f64 {
+    let price = current_bid * (1.0 + offset_percent / 100.0);
+    // Округление до tick_size (0.01 для SOLUSDT)
+    (price * 100.0).round() / 100.0
+}
+
+// Использование:
+let order_price = get_order_price(bt.bid_price, -1.0);  // -1% от bid
+```
+
+### 4.4 Простой спред:
+
+```rust
+fn get_mid_price(bt: &CBookTicker) -> f64 {
+    (bt.bid_price + bt.ask_price) / 2.0
+}
+
+fn get_spread(bt: &CBookTicker) -> f64 {
+    bt.ask_price - bt.bid_price
+}
+
+// Использование:
+let mid = get_mid_price(bt);
+let spread = get_spread(bt);
+println!("Mid: {:.2}, Spread: {:.4}", mid, spread);
+```
+
+### 4.5 Скользящее среднее:
+
+```rust
+use std::collections::VecDeque;
+
+struct Strategy {
+    prices: VecDeque<f64>,
+    window: usize,
+}
+
+impl Strategy {
+    fn new(window: usize) -> Self {
+        Self {
+            prices: VecDeque::with_capacity(window + 1),
+            window,
+        }
+    }
+    
+    fn update(&mut self, price: f64) {
+        self.prices.push_back(price);
+        if self.prices.len() > self.window {
+            self.prices.pop_front();
+        }
+    }
+    
+    fn average(&self) -> Option<f64> {
+        if self.prices.len() < self.window {
+            return None;
+        }
+        Some(self.prices.iter().sum::<f64>() / self.window as f64)
+    }
+}
+
+// Использование:
+strategy.update(bt.bid_price);
+if let Some(avg) = strategy.average() {
+    println!("MA: {:.2}", avg);
+}
+```
+
+## 5. ВАЖНЫЕ ПРАВИЛА
+
+### 5.1 Binance параметры (SOLUSDT):
+- **tickSize** (цена): 0.01 - цена должна быть кратна 0.01
+- **stepSize** (количество): 1.0 - количество кратно 1.0
+- **minQty**: 1.0 - минимум 1 SOL на ордер
+
+### 5.2 Округление:
+
+```rust
+fn round_price(price: f64) -> f64 {
+    (price / 0.01).round() * 0.01
+}
+
+fn round_quantity(qty: f64) -> f64 {
+    (qty / 1.0).round() * 1.0
+}
+
+// Использование:
+let price = round_price(127.456);  // 127.46
+let qty = round_quantity(1.3);     // 1.0
+```
+
+### 5.3 recv_timeout:
+- Всегда используй `recv_timeout(Duration::from_millis(100))`
+- Это позволяет проверять STOP_FLAG регулярно
+- Timeout НЕ означает ошибку - это нормально
+
+### 5.4 CString создавать один раз:
+```rust
+// ✅ ПРАВИЛЬНО: создаём один раз перед циклом
+let api_key = CString::new("KEY").unwrap();
+while !STOP_FLAG.load(Ordering::Relaxed) {
+    unsafe { place_order(api_key.as_ptr(), ...); }
+}
+
+// ❌ НЕПРАВИЛЬНО: создаём в цикле (медленно)
+while !STOP_FLAG.load(Ordering::Relaxed) {
+    let api_key = CString::new("KEY").unwrap();  // каждую итерацию!
+    unsafe { place_order(api_key.as_ptr(), ...); }
+}
+```
+
+### 5.5 Callback должен быть unsafe extern "C":
+```rust
+// ✅ ПРАВИЛЬНО
+unsafe extern "C" fn my_callback(result: OrderResult) {
+    println!("Order: {}", result.order_id);
+}
+
+// ❌ НЕПРАВИЛЬНО
+fn my_callback(result: OrderResult) {  // не extern "C"
+    println!("Order: {}", result.order_id);
+}
+```
+
+## 6. ШАБЛОН ДЛЯ БЫСТРОГО СТАРТА
+
+```rust
+use crossbeam::channel::Receiver;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
+use std::ffi::CString;
+
+static STOP_FLAG: AtomicBool = AtomicBool::new(false);
+
+struct Strategy {
+    // TODO: добавь свои поля
+}
+
+impl Strategy {
+    fn new() -> Self {
+        Self {
+            // TODO: инициализация
+        }
+    }
+    
+    fn on_book_ticker(&mut self, bt: &CBookTicker) {
+        if !bt.symbol_str().eq_ignore_ascii_case("solusdt") {
+            return;
+        }
+        
+        // TODO: логика обработки BookTicker
+    }
+}
+
+unsafe extern "C" fn order_callback(result: OrderResult) {
+    if result.success {
+        println!("✅ Order ID: {}", result.order_id);
+    } else {
+        println!("❌ Error: {}", result.error_code);
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn run(
+    rx_ptr: *mut Receiver<CEvent>,
+    place_order: PlaceOrderFn,
+    _cancel_order: CancelOrderFn,
+) -> i32 {
+    println!("🚀 Strategy started");
+    
+    let rx = unsafe { &*rx_ptr };
+    let mut strategy = Strategy::new();
+    
+    let api_key = CString::new("YOUR_API_KEY").unwrap();
+    let secret_key = CString::new("YOUR_SECRET_KEY").unwrap();
+    let symbol = CString::new("SOLUSDT").unwrap();
+    let side = CString::new("BUY").unwrap();
+    
+    while !STOP_FLAG.load(Ordering::Relaxed) {
+        match rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(event) if event.event_type == 0 => {
+                let bt = unsafe { &event.data.book_ticker };
+                strategy.on_book_ticker(bt);
+                
+                // TODO: условие для отправки ордера
+                if false {  // замени на свое условие
+                    unsafe {
+                        place_order(
+                            api_key.as_ptr(),
+                            secret_key.as_ptr(),
+                            symbol.as_ptr(),
+                            127.0,  // TODO: динамическая цена
+                            1.0,
+                            side.as_ptr(),
+                            order_callback,
+                        );
+                    }
+                }
+            }
+            Err(crossbeam::channel::RecvTimeoutError::Timeout) => continue,
+            Err(_) => break,
+            _ => {}
+        }
+    }
+    
+    println!("🛑 Strategy stopped");
+    0
+}
+
+#[no_mangle]
+pub extern "C" fn stop() {
+    println!("🛑 Stop signal received");
+    STOP_FLAG.store(true, Ordering::Relaxed);
+}
+```
+
+---
+
+Теперь ты знаешь как писать стратегии. Жду задачу!
+```

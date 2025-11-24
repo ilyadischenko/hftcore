@@ -1,5 +1,5 @@
 use axum::{
-    routing::post,
+    routing::{post, get},
     extract::{Json, State},
     Router,
     http::StatusCode,
@@ -23,7 +23,6 @@ mod strategies;
 
 use crate::routes::strategy;
 use crate::strategies::{StrategyStorage, StrategyRunner};
-// use crate::routes::strategy::{strategy_routes, runtime_routes}; 
 use crate::ffi_types::{CEvent};
 use crate::strategies::init_trading;
 
@@ -149,6 +148,7 @@ async fn main() {
         // ═══════════════════════════════════════════════════════════
         .route("/order/test", post(test_order))
         .route("/order/cancel", post(cancel_order))
+        .route("/ping/order", get(ping_order))
         
         // Legacy
         .route("/login", post(login_session))
@@ -442,4 +442,282 @@ async fn unsubscribe_trades(
         Ok(_) => format!("Unsubscribed from {}", req.ticker),
         Err(e) => format!("Error: {e}"),
     }
+}
+
+
+// В секции REQUEST/RESPONSE ТИПЫ добавь:
+
+#[derive(Serialize)]
+struct OrderPingResponse {
+    success: bool,
+    ping_ms: f64,
+    order_place_ms: f64,
+    order_cancel_ms: f64,
+    total_ms: f64,
+    order_id: Option<i64>,
+    test_price: f64,
+    current_bid: f64,
+    message: String,
+}
+
+
+
+
+// В конце файла добавь handler:
+
+// ═══════════════════════════════════════════════════════════
+// PING ORDER - замер латентности выставления/отмены ордера
+// ═══════════════════════════════════════════════════════════
+
+/// GET /ping/order - проверка пинга выставления ордера
+async fn ping_order(
+    State(app): State<Arc<AppContext>>,
+) -> (StatusCode, Json<OrderPingResponse>) {
+    tracing::info!("🏓 Starting order ping test...");
+    
+    // ═══════════════════════════════════════════════════════════
+    // 1. Получаем текущую цену из последнего события
+    // ═══════════════════════════════════════════════════════════
+    
+    let mut event_rx = app.event_broadcaster.subscribe();
+    
+    let current_bid = loop {
+        match tokio::time::timeout(Duration::from_secs(5), event_rx.recv()).await {
+            Ok(Ok(event)) if event.event_type == 0 => {
+                let bt = unsafe { &event.data.book_ticker };
+                let symbol = unsafe {
+                    std::str::from_utf8_unchecked(&bt.symbol[..bt.symbol_len as usize])
+                };
+                
+                if symbol.eq_ignore_ascii_case("solusdt") {
+                    break bt.bid_price;
+                }
+            }
+            Ok(Ok(_)) => continue,
+            Ok(Err(_)) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(OrderPingResponse {
+                        success: false,
+                        ping_ms: 0.0,
+                        order_place_ms: 0.0,
+                        order_cancel_ms: 0.0,
+                        total_ms: 0.0,
+                        order_id: None,
+                        test_price: 0.0,
+                        current_bid: 0.0,
+                        message: "Event channel closed".to_string(),
+                    }),
+                );
+            }
+            Err(_) => {
+                return (
+                    StatusCode::REQUEST_TIMEOUT,
+                    Json(OrderPingResponse {
+                        success: false,
+                        ping_ms: 0.0,
+                        order_place_ms: 0.0,
+                        order_cancel_ms: 0.0,
+                        total_ms: 0.0,
+                        order_id: None,
+                        test_price: 0.0,
+                        current_bid: 0.0,
+                        message: "No SOLUSDT data received in 5 seconds. Subscribe to bookticker first.".to_string(),
+                    }),
+                );
+            }
+        }
+    };
+    
+    // ═══════════════════════════════════════════════════════════
+    // 2. Рассчитываем безопасную цену (50% от bid - не исполнится)
+    // ═══════════════════════════════════════════════════════════
+    
+    let safe_price = (current_bid * 0.5 * 100.0).round() / 100.0;
+    
+    tracing::info!(
+        "Current bid: ${:.2}, Test price: ${:.2} (50% below)",
+        current_bid,
+        safe_price
+    );
+    
+    // ═══════════════════════════════════════════════════════════
+    // 3. Выставляем ордер и замеряем время
+    // ═══════════════════════════════════════════════════════════
+    
+    let (place_tx, place_rx) = tokio::sync::oneshot::channel();
+    let place_tx = Arc::new(tokio::sync::Mutex::new(Some(place_tx)));
+    
+    let start_place = Instant::now();
+    
+    app.trade_manager
+        .send_limit_order(
+            "ay0LdRfUbErVi6jTAanIjiuASqId3oLQYibIwCRQY3OLKiKdHCVGvLQgtH9X5wWm",
+            "3AJ2HfjBkNPKwfsPswkzAkqVx6Jawm3xSQTOMKJ1ib5e4Wa9DEM5ddvfhDjeqPO4",
+            "SOLUSDT",
+            safe_price,
+            1.0,  // минимальный объем
+            "BUY",
+            move |resp: Value| {
+                let tx_clone = place_tx.clone();
+                tokio::spawn(async move {
+                    if let Some(sender) = tx_clone.lock().await.take() {
+                        let _ = sender.send(resp);
+                    }
+                });
+            },
+        )
+        .await;
+    
+    // Ждём ответ на размещение
+    let (order_id, order_place_ms) = match tokio::time::timeout(Duration::from_secs(10), place_rx).await {
+        Ok(Ok(response)) => {
+            let elapsed = start_place.elapsed().as_secs_f64() * 1000.0;
+            
+            if let Some(error) = response.get("error") {
+                tracing::error!("❌ Order placement failed: {}", error);
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(OrderPingResponse {
+                        success: false,
+                        ping_ms: elapsed,
+                        order_place_ms: elapsed,
+                        order_cancel_ms: 0.0,
+                        total_ms: elapsed,
+                        order_id: None,
+                        test_price: safe_price,
+                        current_bid,
+                        message: format!("Order failed: {}", error),
+                    }),
+                );
+            }
+            
+            if let Some(order_id) = response["result"]["orderId"].as_i64() {
+                tracing::info!("✅ Order placed in {:.2}ms | ID: {}", elapsed, order_id);
+                (order_id, elapsed)
+            } else {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(OrderPingResponse {
+                        success: false,
+                        ping_ms: elapsed,
+                        order_place_ms: elapsed,
+                        order_cancel_ms: 0.0,
+                        total_ms: elapsed,
+                        order_id: None,
+                        test_price: safe_price,
+                        current_bid,
+                        message: "No orderId in response".to_string(),
+                    }),
+                );
+            }
+        }
+        Ok(Err(_)) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(OrderPingResponse {
+                    success: false,
+                    ping_ms: 0.0,
+                    order_place_ms: 0.0,
+                    order_cancel_ms: 0.0,
+                    total_ms: 0.0,
+                    order_id: None,
+                    test_price: safe_price,
+                    current_bid,
+                    message: "Channel error".to_string(),
+                }),
+            );
+        }
+        Err(_) => {
+            return (
+                StatusCode::REQUEST_TIMEOUT,
+                Json(OrderPingResponse {
+                    success: false,
+                    ping_ms: 10000.0,
+                    order_place_ms: 10000.0,
+                    order_cancel_ms: 0.0,
+                    total_ms: 10000.0,
+                    order_id: None,
+                    test_price: safe_price,
+                    current_bid,
+                    message: "Order placement timeout (10s)".to_string(),
+                }),
+            );
+        }
+    };
+    
+    // ═══════════════════════════════════════════════════════════
+    // 4. Отменяем ордер и замеряем время
+    // ═══════════════════════════════════════════════════════════
+    
+    let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
+    let cancel_tx = Arc::new(tokio::sync::Mutex::new(Some(cancel_tx)));
+    
+    let start_cancel = Instant::now();
+    
+    app.trade_manager
+        .cancel_limit_order(
+            "ay0LdRfUbErVi6jTAanIjiuASqId3oLQYibIwCRQY3OLKiKdHCVGvLQgtH9X5wWm",
+            "3AJ2HfjBkNPKwfsPswkzAkqVx6Jawm3xSQTOMKJ1ib5e4Wa9DEM5ddvfhDjeqPO4",
+            "SOLUSDT",
+            &order_id.to_string(),
+            move |resp: Value| {
+                let tx_clone = cancel_tx.clone();
+                tokio::spawn(async move {
+                    if let Some(sender) = tx_clone.lock().await.take() {
+                        let _ = sender.send(resp);
+                    }
+                });
+            },
+        )
+        .await;
+    
+    // Ждём ответ на отмену
+    let order_cancel_ms = match tokio::time::timeout(Duration::from_secs(10), cancel_rx).await {
+        Ok(Ok(response)) => {
+            let elapsed = start_cancel.elapsed().as_secs_f64() * 1000.0;
+            
+            if let Some(error) = response.get("error") {
+                tracing::warn!("⚠️ Order cancellation failed: {}", error);
+            } else {
+                tracing::info!("✅ Order cancelled in {:.2}ms", elapsed);
+            }
+            
+            elapsed
+        }
+        Ok(Err(_)) => 0.0,
+        Err(_) => 10000.0,
+    };
+    
+    // ═══════════════════════════════════════════════════════════
+    // 5. Возвращаем результаты
+    // ═══════════════════════════════════════════════════════════
+
+    let total_ms = order_place_ms + order_cancel_ms;
+    let ping_ms = order_place_ms;  // основной пинг - размещение ордера
+    
+    tracing::info!(
+        "🏓 Ping test completed | Place: {:.2}ms | Cancel: {:.2}ms | Total: {:.2}ms",
+        order_place_ms,
+        order_cancel_ms,
+        total_ms
+    );
+    
+    (
+        StatusCode::OK,
+        Json(OrderPingResponse {
+            success: true,
+            ping_ms,
+            order_place_ms,
+            order_cancel_ms,
+            total_ms,
+            order_id: Some(order_id),
+            test_price: safe_price,
+            current_bid,
+            message: format!(
+                "Order placed and cancelled successfully. Latency: {:.2}ms",
+                ping_ms
+            ),
+        }),
+    )
 }
