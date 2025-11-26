@@ -1,0 +1,9 @@
+{
+  "id": "funding_collector",
+  "name": "Funding Collector",
+  "symbol": "SOLUSDT",
+  "enabled": false,
+  "open_positions": true,
+  "created_at": 1764181615,
+  "updated_at": 1764181615
+}

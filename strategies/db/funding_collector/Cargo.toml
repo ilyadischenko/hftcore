@@ -1,5 +1,5 @@
 [package]
-name = "{{STRATEGY_NAME}}"
+name = "funding_collector"
 version = "0.1.0"
 edition = "2021"
 

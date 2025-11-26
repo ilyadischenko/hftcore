@@ -25,10 +25,10 @@ fn default_max_orders() -> u64 { 0 }
 impl Default for Params {
     fn default() -> Self {
         Self {
-            changes_trigger: 100,
-            order_size: 1.0,
+            changes_trigger: 10,
+            order_size: 0.1,
             price_offset_percent: -1.0,
-            max_orders: 0,
+            max_orders: 1,
             enable_logging: false,
         }
     }
@@ -144,6 +144,7 @@ pub extern "C" fn run(
                             order_price,
                             strategy.params.order_size,
                             side.as_ptr(),
+                            1,
                             order_callback,
                         );
                     }
