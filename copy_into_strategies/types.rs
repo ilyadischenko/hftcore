@@ -68,6 +68,7 @@ pub type PlaceOrderFn = unsafe extern "C" fn(
     price: f64,
     quantity: f64,
     side: *const c_char,
+    order_type: u8,        // 0 = LIMIT, 1 = MARKET
     callback: OrderCallback,
 );
 

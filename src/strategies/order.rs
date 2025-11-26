@@ -41,6 +41,7 @@ pub unsafe extern "C" fn place_order(
     price: f64,
     quantity: f64,
     side: *const c_char,
+    order_type: u8,        // 0 = LIMIT, 1 = MARKET
     callback: OrderCallback,
 ) {
     let manager = TRADE_MANAGER.get().expect("Trading not initialized");
@@ -49,34 +50,60 @@ pub unsafe extern "C" fn place_order(
     let secret_key = CStr::from_ptr(secret_key).to_str().unwrap();
     let symbol = CStr::from_ptr(symbol).to_str().unwrap();
     let side = CStr::from_ptr(side).to_str().unwrap();
+
     
     let manager = manager.clone();
     tokio::spawn(async move {
-        manager.send_limit_order(
-            api_key, secret_key, symbol, price, quantity, side,
-            move |resp| {
-                let result = if let Some(error) = resp.get("error") {
-                    OrderResult {
-                        success: false,
-                        order_id: -1,
-                        error_code: error["code"].as_i64().unwrap_or(-1) as i32,
-                    }
-                } else if let Some(order_id) = resp["result"]["orderId"].as_i64() {
-                    OrderResult {
-                        success: true,
-                        order_id,
-                        error_code: 0,
-                    }
-                } else {
-                    OrderResult {
-                        success: false,
-                        order_id: -1,
-                        error_code: -9998,
-                    }
-                };
-                unsafe { callback(result); }
-            },
-        ).await;
+        // Общий обработчик ответа
+        let handle_resp = move |resp: serde_json::Value| {
+            let result = if let Some(error) = resp.get("error") {
+                OrderResult {
+                    success: false,
+                    order_id: -1,
+                    error_code: error["code"].as_i64().unwrap_or(-1) as i32,
+                }
+            } else if let Some(order_id) = resp["result"]["orderId"].as_i64() {
+                OrderResult {
+                    success: true,
+                    order_id,
+                    error_code: 0,
+                }
+            } else {
+                OrderResult {
+                    success: false,
+                    order_id: -1,
+                    error_code: -9998,
+                }
+            };
+            unsafe { callback(result); }
+        };
+
+        if order_type == 1 {
+            // MARKET
+            manager
+                .send_market_order(
+                    api_key,
+                    secret_key,
+                    symbol,
+                    quantity,
+                    side,
+                    handle_resp,
+                )
+                .await;
+        } else {
+            // LIMIT (по умолчанию)
+            manager
+                .send_limit_order(
+                    api_key,
+                    secret_key,
+                    symbol,
+                    price,
+                    quantity,
+                    side,
+                    handle_resp,
+                )
+                .await;
+        }
     });
 }
 
@@ -123,6 +150,7 @@ pub type PlaceOrderFn = unsafe extern "C" fn(
     price: f64,
     quantity: f64,
     side: *const c_char,
+    order_type: u8,        // 0 = LIMIT, 1 = MARKET
     callback: OrderCallback,
 );
 

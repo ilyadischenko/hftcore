@@ -188,11 +188,11 @@ async fn test_order(
     let tx = Arc::new(tokio::sync::Mutex::new(Some(tx)));
 
     app.trade_manager
-        .send_limit_order(
+        .send_market_order(
             &req.api_key,
             &req.secret_key,
             &req.symbol,
-            req.price,
+            // req.price,
             req.quantity,
             &req.side,
             move |resp: Value| {
@@ -556,7 +556,7 @@ async fn ping_order(
             "3AJ2HfjBkNPKwfsPswkzAkqVx6Jawm3xSQTOMKJ1ib5e4Wa9DEM5ddvfhDjeqPO4",
             "SOLUSDT",
             safe_price,
-            1.0,  // минимальный объем
+            0.1,  // минимальный объем
             "BUY",
             move |resp: Value| {
                 let tx_clone = place_tx.clone();

@@ -42,6 +42,13 @@ pub enum Command {
         qty: f64,
         side: String,
     },
+    SendMarketOrder {
+        api_key: String,
+        secret_key: String,
+        symbol: String,
+        qty: f64,
+        side: String,
+    },
     CancelLimitOrder {
         api_key: String,
         secret_key: String,
@@ -309,6 +316,7 @@ impl ExchangeTrade {
     // ═══════════════════════════════════════════════════════════
     // ИЗМЕНЕНИЕ: берем ключи из команды
     // ═══════════════════════════════════════════════════════════
+
     fn build_message_for_cmd(&self, cmd: &Command, id: &str) -> Option<String> {
         let local_time_ms = Utc::now().timestamp_millis();
         
@@ -337,7 +345,10 @@ impl ExchangeTrade {
                 p.insert("timestamp", ts.clone());
                 p.insert("type", "LIMIT".to_string());
 
-                let query = p.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join("&");
+                let query = p.iter()
+                    .map(|(k, v)| format!("{k}={v}"))
+                    .collect::<Vec<_>>()
+                    .join("&");
 
                 let mut mac = HmacSha256::new_from_slice(secret_key.as_bytes()).ok()?;
                 mac.update(query.as_bytes());
@@ -365,6 +376,49 @@ impl ExchangeTrade {
                 Some(msg_json.to_string())
             }
 
+            Command::SendMarketOrder { api_key, secret_key, symbol, qty, side } => {
+                let mut buf_qty = Buffer::new();
+                let qty_str = buf_qty.format(*qty);
+
+                let mut p: BTreeMap<&str, String> = BTreeMap::new();
+                p.insert("apiKey", api_key.clone());
+                p.insert("positionSide", "BOTH".to_string());
+                p.insert("quantity", qty_str.to_string());
+                p.insert("recvWindow", "5000".to_string());
+                p.insert("side", side.to_uppercase());
+                p.insert("symbol", symbol.to_uppercase());
+                p.insert("timestamp", ts.clone());
+                p.insert("type", "MARKET".to_string());
+
+                let query = p.iter()
+                    .map(|(k, v)| format!("{k}={v}"))
+                    .collect::<Vec<_>>()
+                    .join("&");
+
+                let mut mac = HmacSha256::new_from_slice(secret_key.as_bytes()).ok()?;
+                mac.update(query.as_bytes());
+                let signature = hex::encode(mac.finalize().into_bytes());
+
+                let mut params_json = serde_json::Map::new();
+                params_json.insert("apiKey".into(), Value::String(api_key.clone()));
+                params_json.insert("positionSide".into(), Value::String("BOTH".into()));
+                params_json.insert("quantity".into(), Value::Number(serde_json::Number::from_f64(*qty)?));
+                params_json.insert("recvWindow".into(), Value::String("5000".into()));
+                params_json.insert("side".into(), Value::String(side.to_uppercase()));
+                params_json.insert("symbol".into(), Value::String(symbol.to_uppercase()));
+                params_json.insert("timestamp".into(), Value::String(ts));
+                params_json.insert("type".into(), Value::String("MARKET".into()));
+                params_json.insert("signature".into(), Value::String(signature));
+
+                let msg_json = json!({
+                    "id": id,
+                    "method": "order.place",
+                    "params": params_json
+                });
+
+                Some(msg_json.to_string())
+            }
+
             Command::CancelLimitOrder { api_key, secret_key, symbol, order_id } => {
                 let mut p: BTreeMap<&str, String> = BTreeMap::new();
                 p.insert("apiKey", api_key.clone());
@@ -373,7 +427,10 @@ impl ExchangeTrade {
                 p.insert("symbol", symbol.to_uppercase());
                 p.insert("timestamp", ts);
 
-                let query = p.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join("&");
+                let query = p.iter()
+                    .map(|(k, v)| format!("{k}={v}"))
+                    .collect::<Vec<_>>()
+                    .join("&");
 
                 let mut mac = HmacSha256::new_from_slice(secret_key.as_bytes()).ok()?;
                 mac.update(query.as_bytes());
@@ -439,6 +496,30 @@ impl ExchangeTrade {
                 secret_key: secret_key.to_string(),
                 symbol: symbol.to_string(),
                 price,
+                qty: size,
+                side: side.to_string(),
+            },
+            callback,
+        )
+        .await;
+    }
+
+    pub async fn send_market_order<F>(
+        &self,
+        api_key: &str,
+        secret_key: &str,
+        symbol: &str,
+        size: f64,
+        side: &str,
+        callback: F,
+    ) where
+        F: Fn(Value) + Send + Sync + 'static,
+    {
+        self.send_command(
+            Command::SendMarketOrder {
+                api_key: api_key.to_string(),
+                secret_key: secret_key.to_string(),
+                symbol: symbol.to_string(),
                 qty: size,
                 side: side.to_string(),
             },
