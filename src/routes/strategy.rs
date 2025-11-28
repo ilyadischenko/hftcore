@@ -11,678 +11,312 @@ use serde_json::Value;
 use std::sync::Arc;
 use tokio::sync::broadcast;
 
-use crate::strategies::storage::{StrategyStorage, Strategy, StrategyMetadata};
-use crate::strategies::manager::StrategyRunner;
+use crate::strategies::storage::StrategyStorage;
+use crate::strategies::manager::{StrategyRunner, InstanceInfo};
 use crate::ffi_types::CEvent;
 
 // ═══════════════════════════════════════════════════════════
-// REQUEST/RESPONSE ТИПЫ
+// STATE
+// ═══════════════════════════════════════════════════════════
+
+#[derive(Clone)]
+pub struct AppState {
+    pub storage: Arc<StrategyStorage>,
+    pub runner: Arc<StrategyRunner>,
+    pub event_tx: broadcast::Sender<CEvent>,
+}
+
+// ═══════════════════════════════════════════════════════════
+// REQUESTS
 // ═══════════════════════════════════════════════════════════
 
 #[derive(Deserialize)]
-pub struct CreateStrategyRequest {
+pub struct CreateRequest {
     pub id: String,
-    pub name: String,
-    pub symbol: String,
     pub code: String,
 }
 
 #[derive(Deserialize)]
-pub struct UpdateCodeRequest {
+pub struct CodeRequest {
     pub code: String,
 }
 
 #[derive(Deserialize)]
-pub struct UpdateMetadataRequest {
-    pub name: Option<String>,
-    pub symbol: Option<String>,
-    pub enabled: Option<bool>,
-    pub open_positions: Option<bool>,
+pub struct StartRequest {
+    pub symbol: String,
+    #[serde(default)]
+    pub params: Value,
 }
 
-#[derive(Deserialize)]
-pub struct StartInstanceRequest {
-    pub symbol: String,
-    pub params: Option<Value>,  // JSON объект с параметрами
-}
+// ═══════════════════════════════════════════════════════════
+// RESPONSES
+// ═══════════════════════════════════════════════════════════
 
 #[derive(Serialize)]
-pub struct ApiResponse {
-    pub success: bool,
-    pub message: String,
+pub struct ApiResult<T = ()> {
+    pub ok: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub data: Option<serde_json::Value>,
+    pub error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data: Option<T>,
+}
+
+impl<T: Serialize> ApiResult<T> {
+    fn ok(data: T) -> (StatusCode, Json<Self>) {
+        (StatusCode::OK, Json(Self { ok: true, error: None, data: Some(data) }))
+    }
+    
+    fn created(data: T) -> (StatusCode, Json<Self>) {
+        (StatusCode::CREATED, Json(Self { ok: true, error: None, data: Some(data) }))
+    }
+    
+    // Generic error - работает для любого T
+    fn err(status: StatusCode, msg: impl Into<String>) -> (StatusCode, Json<Self>) {
+        (status, Json(Self { ok: false, error: Some(msg.into()), data: None }))
+    }
+}
+
+impl ApiResult<()> {
+    fn ok_empty() -> (StatusCode, Json<Self>) {
+        (StatusCode::OK, Json(Self { ok: true, error: None, data: None }))
+    }
+    
+    fn created_empty() -> (StatusCode, Json<Self>) {
+        (StatusCode::CREATED, Json(Self { ok: true, error: None, data: None }))
+    }
 }
 
 #[derive(Serialize)]
-pub struct StrategyResponse {
-    pub metadata: StrategyMetadata,
+pub struct StrategyDetail {
+    pub id: String,
     pub code: String,
+    pub compiled: bool,
+    pub instances: Vec<InstanceInfo>,
 }
 
 #[derive(Serialize)]
-pub struct CompilationResponse {
+pub struct StrategyListItem {
+    pub id: String,
+    pub compiled: bool,
+    pub instances: usize,
+}
+
+#[derive(Serialize)]
+pub struct CompileResult {
     pub success: bool,
-    pub output: String,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub errors: Vec<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub lib_path: Option<String>,
 }
 
 // ═══════════════════════════════════════════════════════════
-// STATE для runtime роутов
+// ROUTER
 // ═══════════════════════════════════════════════════════════
 
-type RuntimeState = (
-    Arc<StrategyStorage>,
-    Arc<StrategyRunner>,
-    broadcast::Sender<CEvent>,
-);
-
-// ═══════════════════════════════════════════════════════════
-// РОУТЕР ДЛЯ CRUD ОПЕРАЦИЙ
-// ═══════════════════════════════════════════════════════════
-
-pub fn strategy_routes(storage: Arc<StrategyStorage>) -> Router {
+pub fn routes(state: AppState) -> Router {
     Router::new()
-        // CRUD операции
-        .route("/strategies", post(create_strategy))
+        // Стратегии
         .route("/strategies", get(list_strategies))
-        .route("/strategies/:id", get(get_strategy))
-        .route("/strategies/:id", delete(delete_strategy))
+        .route("/strategies", post(create_strategy))
+        .route("/strategies/{id}", get(get_strategy))
+        .route("/strategies/{id}", delete(delete_strategy))
+        .route("/strategies/{id}/code", put(update_code))
+        .route("/strategies/{id}/compile", post(compile))
         
-        // Работа с кодом
-        .route("/strategies/:id/code", get(get_code))
-        .route("/strategies/:id/code", put(update_code))
+        // Запуск/остановка
+        .route("/strategies/{id}/start", post(start))
+        .route("/strategies/{id}/stop", post(stop_all))
+        .route("/strategies/{id}/stop/{symbol}", post(stop_one))
         
-        // Работа с метаданными
-        .route("/strategies/:id/metadata", put(update_metadata))
+        // Инстансы
+        .route("/instances", get(list_instances))
+        .route("/instances/{instance_id}", get(get_instance))
+        .route("/instances/{instance_id}/stop", post(stop_instance))
         
-        // Компиляция и проверка
-        .route("/strategies/:id/compile", post(compile_strategy))
-        .route("/strategies/:id/check", post(check_strategy))
-        
-        .with_state(storage)
+        .with_state(state)
 }
 
 // ═══════════════════════════════════════════════════════════
-// РОУТЕР ДЛЯ ЗАПУСКА/ОСТАНОВКИ
+// СТРАТЕГИИ
 // ═══════════════════════════════════════════════════════════
 
-pub fn runtime_routes(
-    storage: Arc<StrategyStorage>,
-    runner: Arc<StrategyRunner>,
-    event_tx: broadcast::Sender<CEvent>,
-) -> Router {
-    Router::new()
-        // Новый API (с instances)
-        .route("/strategies/:id/instances/:symbol/start", post(start_instance))
-        .route("/instances/:instance_id/stop", post(stop_instance))
-        .route("/instances/running", get(list_running_instances))
-        
-        // Старый API (обратная совместимость)
-        .route("/strategies/:id/start", post(start_strategy))
-        .route("/strategies/:id/stop", post(stop_strategy))
-        .route("/strategies/running", get(list_running))
-        
-        .with_state((storage, runner, event_tx))
+async fn list_strategies(State(s): State<AppState>) -> Json<Vec<StrategyListItem>> {
+    let list = s.storage.list().unwrap_or_default();
+    
+    Json(list.into_iter().map(|info| {
+        StrategyListItem {
+            id: info.id.clone(),
+            compiled: info.compiled,
+            instances: s.runner.list_for(&info.id).len(),
+        }
+    }).collect())
 }
 
-// ═══════════════════════════════════════════════════════════
-// CRUD ОПЕРАЦИИ
-// ═══════════════════════════════════════════════════════════
 
-/// POST /strategies - создать новую стратегию
 async fn create_strategy(
-    State(storage): State<Arc<StrategyStorage>>,
-    Json(req): Json<CreateStrategyRequest>,
-) -> (StatusCode, Json<ApiResponse>) {
-    let strategy = Strategy::new(
-        req.id.clone(),
-        req.name,
-        req.symbol,
-        req.code,
-    );
+    State(s): State<AppState>,
+    Json(req): Json<CreateRequest>,
+) -> (StatusCode, Json<ApiResult>) {
+    if let Err(e) = s.storage.create(&req.id, &req.code) {
+        return ApiResult::err(StatusCode::BAD_REQUEST, e.to_string());
+    }
     
-    match storage.create(strategy) {
-        Ok(_) => {
-            // Сразу пробуем скомпилировать
-            match storage.compile(&req.id) {
-                Ok(result) => {
-                    if result.success {
-                        (
-                            StatusCode::CREATED,
-                            Json(ApiResponse {
-                                success: true,
-                                message: format!("Strategy '{}' created and compiled", req.id),
-                                data: Some(serde_json::json!({
-                                    "id": req.id,
-                                    "compiled": true,
-                                })),
-                            }),
-                        )
-                    } else {
-                        (
-                            StatusCode::CREATED,
-                            Json(ApiResponse {
-                                success: true,
-                                message: format!(
-                                    "Strategy '{}' created but compilation failed",
-                                    req.id
-                                ),
-                                data: Some(serde_json::json!({
-                                    "id": req.id,
-                                    "compiled": false,
-                                    "errors": result.errors,
-                                })),
-                            }),
-                        )
-                    }
-                }
-                Err(e) => {
-                    (
-                        StatusCode::CREATED,
-                        Json(ApiResponse {
-                            success: true,
-                            message: format!(
-                                "Strategy '{}' created but compilation error: {}",
-                                req.id, e
-                            ),
-                            data: None,
-                        }),
-                    )
-                }
-            }
-        }
-        Err(e) => {
-            (
-                StatusCode::BAD_REQUEST,
-                Json(ApiResponse {
-                    success: false,
-                    message: format!("Failed to create strategy: {}", e),
-                    data: None,
-                }),
-            )
-        }
-    }
+    let _ = s.storage.compile(&req.id);
+    
+    ApiResult::created_empty()
 }
 
-/// GET /strategies - список всех стратегий
-async fn list_strategies(
-    State(storage): State<Arc<StrategyStorage>>,
-) -> (StatusCode, Json<Vec<StrategyMetadata>>) {
-    match storage.list() {
-        Ok(strategies) => (StatusCode::OK, Json(strategies)),
-        Err(_) => (StatusCode::OK, Json(vec![])),
-    }
-}
-
-/// GET /strategies/:id - получить стратегию
 async fn get_strategy(
-    State(storage): State<Arc<StrategyStorage>>,
+    State(s): State<AppState>,
     Path(id): Path<String>,
-) -> Result<(StatusCode, Json<StrategyResponse>), (StatusCode, Json<ApiResponse>)> {
-    match storage.load(&id) {
-        Ok(strategy) => Ok((
-            StatusCode::OK,
-            Json(StrategyResponse {
-                metadata: strategy.metadata,
-                code: strategy.code,
-            }),
-        )),
-        Err(e) => Err((
-            StatusCode::NOT_FOUND,
-            Json(ApiResponse {
-                success: false,
-                message: format!("Strategy not found: {}", e),
-                data: None,
-            }),
-        )),
-    }
+) -> Result<(StatusCode, Json<ApiResult<StrategyDetail>>), (StatusCode, Json<ApiResult<StrategyDetail>>)> {
+    let code = s.storage.get_code(&id)
+        .map_err(|e| ApiResult::<StrategyDetail>::err(StatusCode::NOT_FOUND, e.to_string()))?;
+    
+    let compiled = s.storage.get_lib_path(&id).is_ok();
+    let instances = s.runner.list_for(&id);
+    
+    Ok(ApiResult::ok(StrategyDetail { id, code, compiled, instances }))
 }
 
-/// DELETE /strategies/:id - удалить стратегию
 async fn delete_strategy(
-    State(storage): State<Arc<StrategyStorage>>,
+    State(s): State<AppState>,
     Path(id): Path<String>,
-) -> (StatusCode, Json<ApiResponse>) {
-    match storage.delete(&id) {
-        Ok(_) => (
-            StatusCode::OK,
-            Json(ApiResponse {
-                success: true,
-                message: format!("Strategy '{}' deleted", id),
-                data: None,
-            }),
-        ),
-        Err(e) => (
-            StatusCode::NOT_FOUND,
-            Json(ApiResponse {
-                success: false,
-                message: format!("Failed to delete: {}", e),
-                data: None,
-            }),
-        ),
+) -> (StatusCode, Json<ApiResult>) {
+    s.runner.stop_all(&id).await;
+    
+    match s.storage.delete(&id) {
+        Ok(_) => ApiResult::ok_empty(),
+        Err(e) => ApiResult::err(StatusCode::NOT_FOUND, e.to_string()),
     }
 }
 
-// ═══════════════════════════════════════════════════════════
-// РАБОТА С КОДОМ
-// ═══════════════════════════════════════════════════════════
-
-/// GET /strategies/:id/code - получить только код
-async fn get_code(
-    State(storage): State<Arc<StrategyStorage>>,
-    Path(id): Path<String>,
-) -> Result<String, (StatusCode, Json<ApiResponse>)> {
-    match storage.load(&id) {
-        Ok(strategy) => Ok(strategy.code),
-        Err(e) => Err((
-            StatusCode::NOT_FOUND,
-            Json(ApiResponse {
-                success: false,
-                message: format!("Strategy not found: {}", e),
-                data: None,
-            }),
-        )),
-    }
-}
-
-/// PUT /strategies/:id/code - обновить код
 async fn update_code(
-    State(storage): State<Arc<StrategyStorage>>,
+    State(s): State<AppState>,
     Path(id): Path<String>,
-    Json(req): Json<UpdateCodeRequest>,
-) -> (StatusCode, Json<ApiResponse>) {
-    match storage.update_code(&id, req.code) {
-        Ok(_) => {
-            // Проверяем синтаксис
-            match storage.check(&id) {
-                Ok(check_result) => {
-                    if check_result.success {
-                        // Компилируем
-                        match storage.compile(&id) {
-                            Ok(compile_result) => {
-                                if compile_result.success {
-                                    (
-                                        StatusCode::OK,
-                                        Json(ApiResponse {
-                                            success: true,
-                                            message: format!("Code updated and compiled for '{}'", id),
-                                            data: Some(serde_json::json!({
-                                                "compiled": true,
-                                            })),
-                                        }),
-                                    )
-                                } else {
-                                    (
-                                        StatusCode::OK,
-                                        Json(ApiResponse {
-                                            success: true,
-                                            message: "Code updated but compilation failed".to_string(),
-                                            data: Some(serde_json::json!({
-                                                "compiled": false,
-                                                "errors": compile_result.errors,
-                                            })),
-                                        }),
-                                    )
-                                }
-                            }
-                            Err(e) => (
-                                StatusCode::OK,
-                                Json(ApiResponse {
-                                    success: true,
-                                    message: format!("Code updated but compilation error: {}", e),
-                                    data: None,
-                                }),
-                            ),
-                        }
-                    } else {
-                        (
-                            StatusCode::BAD_REQUEST,
-                            Json(ApiResponse {
-                                success: false,
-                                message: "Code has syntax errors".to_string(),
-                                data: Some(serde_json::json!({
-                                    "errors": check_result.errors,
-                                })),
-                            }),
-                        )
-                    }
-                }
-                Err(e) => (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(ApiResponse {
-                        success: false,
-                        message: format!("Check failed: {}", e),
-                        data: None,
-                    }),
-                ),
-            }
-        }
-        Err(e) => (
-            StatusCode::NOT_FOUND,
-            Json(ApiResponse {
-                success: false,
-                message: format!("Failed to update code: {}", e),
-                data: None,
-            }),
-        ),
-    }
-}
-
-// ═══════════════════════════════════════════════════════════
-// РАБОТА С МЕТАДАННЫМИ
-// ═══════════════════════════════════════════════════════════
-
-/// PUT /strategies/:id/metadata - обновить метаданные
-async fn update_metadata(
-    State(storage): State<Arc<StrategyStorage>>,
-    Path(id): Path<String>,
-    Json(req): Json<UpdateMetadataRequest>,
-) -> (StatusCode, Json<ApiResponse>) {
-    match storage.update_metadata(
-        &id,
-        req.name,
-        req.symbol,
-        req.enabled,
-        req.open_positions,
-    ) {
-        Ok(_) => (
-            StatusCode::OK,
-            Json(ApiResponse {
-                success: true,
-                message: format!("Metadata updated for '{}'", id),
-                data: None,
-            }),
-        ),
-        Err(e) => (
-            StatusCode::NOT_FOUND,
-            Json(ApiResponse {
-                success: false,
-                message: format!("Failed to update metadata: {}", e),
-                data: None,
-            }),
-        ),
-    }
-}
-
-// ═══════════════════════════════════════════════════════════
-// КОМПИЛЯЦИЯ И ПРОВЕРКА
-// ═══════════════════════════════════════════════════════════
-
-/// POST /strategies/:id/compile - скомпилировать стратегию
-async fn compile_strategy(
-    State(storage): State<Arc<StrategyStorage>>,
-    Path(id): Path<String>,
-) -> (StatusCode, Json<CompilationResponse>) {
-    match storage.compile(&id) {
-        Ok(result) => {
-            let status = if result.success {
-                StatusCode::OK
-            } else {
-                StatusCode::BAD_REQUEST
-            };
-            
-            (
-                status,
-                Json(CompilationResponse {
-                    success: result.success,
-                    output: result.output,
-                    errors: result.errors,
-                    lib_path: result.lib_path.map(|p| p.to_string_lossy().to_string()),
-                }),
-            )
-        }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(CompilationResponse {
-                success: false,
-                output: format!("Compilation error: {}", e),
-                errors: vec![e.to_string()],
-                lib_path: None,
-            }),
-        ),
-    }
-}
-
-/// POST /strategies/:id/check - проверить синтаксис
-async fn check_strategy(
-    State(storage): State<Arc<StrategyStorage>>,
-    Path(id): Path<String>,
-) -> (StatusCode, Json<CompilationResponse>) {
-    match storage.check(&id) {
-        Ok(result) => {
-            let status = if result.success {
-                StatusCode::OK
-            } else {
-                StatusCode::BAD_REQUEST
-            };
-            
-            (
-                status,
-                Json(CompilationResponse {
-                    success: result.success,
-                    output: result.output,
-                    errors: result.errors,
-                    lib_path: None,
-                }),
-            )
-        }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(CompilationResponse {
-                success: false,
-                output: format!("Check error: {}", e),
-                errors: vec![e.to_string()],
-                lib_path: None,
-            }),
-        ),
-    }
-}
-
-// ═══════════════════════════════════════════════════════════
-// RUNTIME: ЗАПУСК И ОСТАНОВКА (НОВЫЙ API С INSTANCES)
-// ═══════════════════════════════════════════════════════════
-
-/// POST /strategies/:id/instances/:symbol/start - запустить instance на конкретной монете
-async fn start_instance(
-    State((storage, runner, event_tx)): State<RuntimeState>,
-    Path((id, symbol)): Path<(String, String)>,
-    Json(req): Json<StartInstanceRequest>,
-) -> (StatusCode, Json<ApiResponse>) {
-    // Проверяем что стратегия существует
-    if storage.load(&id).is_err() {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(ApiResponse {
-                success: false,
-                message: format!("Strategy '{}' not found", id),
-                data: None,
-            }),
-        );
+    Json(req): Json<CodeRequest>,
+) -> (StatusCode, Json<ApiResult<CompileResult>>) {
+    if !s.runner.list_for(&id).is_empty() {
+        return ApiResult::err(StatusCode::CONFLICT, "Stop all instances first");
     }
     
-    // Получаем путь к библиотеке
-    let lib_path = match storage.get_lib_path(&id) {
-        Ok(path) => path,
+    if let Err(e) = s.storage.update_code(&id, &req.code) {
+        return ApiResult::err(StatusCode::NOT_FOUND, e.to_string());
+    }
+    
+    match s.storage.compile(&id) {
+        Ok(r) => ApiResult::ok(CompileResult { success: r.success, errors: r.errors }),
+        Err(e) => ApiResult::err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
+async fn compile(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+) -> (StatusCode, Json<ApiResult<CompileResult>>) {
+    match s.storage.compile(&id) {
+        Ok(r) => {
+            let status = if r.success { StatusCode::OK } else { StatusCode::BAD_REQUEST };
+            (status, Json(ApiResult {
+                ok: r.success,
+                error: if r.success { None } else { Some("Compilation failed".into()) },
+                data: Some(CompileResult { success: r.success, errors: r.errors }),
+            }))
+        }
+        Err(e) => ApiResult::err(StatusCode::NOT_FOUND, e.to_string()),
+    }
+}
+
+async fn start(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<StartRequest>,
+) -> (StatusCode, Json<ApiResult<InstanceInfo>>) {
+    if !s.storage.exists(&id) {
+        return ApiResult::err(StatusCode::NOT_FOUND, "Strategy not found");
+    }
+    
+    let lib_path = match s.storage.get_lib_path(&id) {
+        Ok(p) => p,
         Err(_) => {
-            // Пробуем скомпилировать
-            match storage.compile(&id) {
-                Ok(result) if result.success => {
-                    result.lib_path.unwrap()
-                }
-                Ok(result) => {
-                    return (
-                        StatusCode::BAD_REQUEST,
-                        Json(ApiResponse {
-                            success: false,
-                            message: "Compilation failed".to_string(),
-                            data: Some(serde_json::json!({ 
-                                "errors": result.errors 
-                            })),
-                        }),
-                    );
-                }
-                Err(e) => {
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(ApiResponse {
-                            success: false,
-                            message: format!("Compilation error: {}", e),
-                            data: None,
-                        }),
-                    );
-                }
+            match s.storage.compile(&id) {
+                Ok(r) if r.success => r.lib_path.unwrap(),
+                Ok(r) => return ApiResult::err(
+                    StatusCode::BAD_REQUEST, 
+                    format!("Compilation failed: {}", r.errors.join("; "))
+                ),
+                Err(e) => return ApiResult::err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
             }
         }
     };
     
-    // Конвертируем параметры в JSON строку
-    let params_json = match req.params {
-        Some(p) => serde_json::to_string(&p).unwrap_or_else(|_| "{}".to_string()),
-        None => "{}".to_string(),
-    };
+    match s.runner.start(
+        id,
+        req.symbol,
+        lib_path,
+        s.event_tx.subscribe(),
+        req.params,
+    ).await {
+        Ok(info) => ApiResult::ok(info),
+        Err(e) => ApiResult::err(StatusCode::BAD_REQUEST, e.to_string()),
+    }
+}
+
+async fn stop_all(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+) -> (StatusCode, Json<ApiResult<Vec<String>>>) {
+    let stopped = s.runner.stop_all(&id).await;
     
-    // Формируем instance_id
+    if stopped.is_empty() {
+        ApiResult::err(StatusCode::NOT_FOUND, "No running instances")
+    } else {
+        ApiResult::ok(stopped)
+    }
+}
+
+async fn stop_one(
+    State(s): State<AppState>,
+    Path((id, symbol)): Path<(String, String)>,
+) -> (StatusCode, Json<ApiResult>) {
     let instance_id = format!("{}:{}", id, symbol.to_uppercase());
     
-    // Запускаем instance с параметрами
-    match runner.start(
-        instance_id.clone(),
-        lib_path,
-        event_tx.subscribe(),
-        symbol.clone(),
-        params_json,
-    ).await {
-        Ok(_) => (
-            StatusCode::OK,
-            Json(ApiResponse {
-                success: true,
-                message: format!("Instance '{}' started", instance_id),
-                data: Some(serde_json::json!({
-                    "instance_id": instance_id,
-                    "strategy_id": id,
-                    "symbol": symbol,
-                })),
-            }),
-        ),
-        Err(e) => (
-            StatusCode::BAD_REQUEST,
-            Json(ApiResponse {
-                success: false,
-                message: format!("Failed to start: {}", e),
-                data: None,
-            }),
-        ),
+    match s.runner.stop(&instance_id).await {
+        Ok(_) => ApiResult::ok_empty(),
+        Err(e) => ApiResult::err(StatusCode::NOT_FOUND, e.to_string()),
     }
 }
 
-/// POST /instances/:instance_id/stop - остановить конкретный instance
 async fn stop_instance(
-    State((_storage, runner, _event_tx)): State<RuntimeState>,
+    State(s): State<AppState>,
     Path(instance_id): Path<String>,
-) -> (StatusCode, Json<ApiResponse>) {
-    match runner.stop(&instance_id).await {
-        Ok(_) => (
-            StatusCode::OK,
-            Json(ApiResponse {
-                success: true,
-                message: format!("Instance '{}' stopped", instance_id),
-                data: None,
-            }),
-        ),
-        Err(e) => (
-            StatusCode::NOT_FOUND,
-            Json(ApiResponse {
-                success: false,
-                message: format!("Failed to stop: {}", e),
-                data: None,
-            }),
-        ),
+) -> (StatusCode, Json<ApiResult>) {
+    match s.runner.stop(&instance_id).await {
+        Ok(_) => ApiResult::ok_empty(),
+        Err(e) => ApiResult::err(StatusCode::NOT_FOUND, e.to_string()),
     }
 }
 
-/// GET /instances/running - список всех запущенных instances
-async fn list_running_instances(
-    State((_storage, runner, _event_tx)): State<RuntimeState>,
-) -> Json<Vec<String>> {
-    Json(runner.list_running())
+async fn get_instance(
+    State(s): State<AppState>,
+    Path(instance_id): Path<String>,
+) -> Result<Json<InstanceInfo>, (StatusCode, Json<ApiResult<InstanceInfo>>)> {
+    s.runner.get(&instance_id)
+        .map(Json)
+        .ok_or_else(|| ApiResult::<InstanceInfo>::err(StatusCode::NOT_FOUND, "Not found"))
 }
 
 // ═══════════════════════════════════════════════════════════
-// RUNTIME: СТАРЫЙ API (ОБРАТНАЯ СОВМЕСТИМОСТЬ)
+// ИНСТАНСЫ
 // ═══════════════════════════════════════════════════════════
 
-/// POST /strategies/:id/start - запустить стратегию (старый API)
-/// Использует symbol из metadata, без дополнительных параметров
-async fn start_strategy(
-    State((storage, runner, event_tx)): State<RuntimeState>,
-    Path(id): Path<String>,
-) -> (StatusCode, Json<ApiResponse>) {
-    // Загружаем стратегию чтобы получить symbol из metadata
-    let strategy = match storage.load(&id) {
-        Ok(s) => s,
-        Err(_) => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(ApiResponse {
-                    success: false,
-                    message: format!("Strategy '{}' not found", id),
-                    data: None,
-                }),
-            );
-        }
-    };
-    
-    let symbol = strategy.metadata.symbol;
-    
-    // Используем новый метод с пустыми параметрами
-    let req = StartInstanceRequest {
-        symbol: symbol.clone(),
-        params: None,
-    };
-    
-    start_instance(
-        State((storage, runner, event_tx)),
-        Path((id, symbol)),
-        Json(req),
-    ).await
+async fn list_instances(State(s): State<AppState>) -> Json<Vec<InstanceInfo>> {
+    Json(s.runner.list())
 }
 
-/// POST /strategies/:id/stop - остановить стратегию (старый API)
-async fn stop_strategy(
-    State((storage, runner, _event_tx)): State<RuntimeState>,
-    Path(id): Path<String>,
-) -> (StatusCode, Json<ApiResponse>) {
-    // Загружаем стратегию чтобы получить symbol
-    let strategy = match storage.load(&id) {
-        Ok(s) => s,
-        Err(_) => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(ApiResponse {
-                    success: false,
-                    message: format!("Strategy '{}' not found", id),
-                    data: None,
-                }),
-            );
-        }
-    };
-    
-    let instance_id = format!("{}:{}", id, strategy.metadata.symbol.to_uppercase());
-    
-    stop_instance(
-        State((storage, runner, broadcast::channel(1).0)),
-        Path(instance_id),
-    ).await
-}
-
-/// GET /strategies/running - список запущенных стратегий (старый API)
-async fn list_running(
-    State((_storage, runner, _event_tx)): State<RuntimeState>,
-) -> Json<Vec<String>> {
-    // Возвращаем все instances (для совместимости)
-    Json(runner.list_running())
-}
+// async fn get_instance(
+//     State(s): State<AppState>,
+//     Path(instance_id): Path<String>,
+// ) -> Result<Json<InstanceInfo>, (StatusCode, Json<ApiResult>)> {
+//     s.runner.get(&instance_id)
+//         .map(Json)
+//         .ok_or_else(|| ApiResult::err(StatusCode::NOT_FOUND, "Not found"))
+// }

@@ -1,9 +1,0 @@
-{
-  "id": "ma_with_stop",
-  "name": "MA Strategy with Stop",
-  "symbol": "BTCUSDT",
-  "enabled": false,
-  "open_positions": true,
-  "created_at": 1763548274,
-  "updated_at": 1763548274
-}

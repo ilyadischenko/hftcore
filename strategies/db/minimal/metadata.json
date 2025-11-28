@@ -1,9 +1,0 @@
-{
-  "id": "minimal",
-  "name": "Minimal Strategy",
-  "symbol": "BTCUSDT",
-  "enabled": false,
-  "open_positions": true,
-  "created_at": 1763740429,
-  "updated_at": 1763740429
-}
