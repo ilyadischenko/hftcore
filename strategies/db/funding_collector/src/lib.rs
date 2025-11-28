@@ -333,6 +333,7 @@ pub extern "C" fn run(
     std::thread::sleep(Duration::from_secs(1));
     
     println!("🛑 Funding Collector stopped");
+    
     0
 }
 

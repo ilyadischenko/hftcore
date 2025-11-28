@@ -1,9 +1,0 @@
-{
-  "id": "sol_market_buyer",
-  "name": "SOL periodic market buyer",
-  "symbol": "SOLUSDT",
-  "enabled": false,
-  "open_positions": true,
-  "created_at": 1764177550,
-  "updated_at": 1764177550
-}

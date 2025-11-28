@@ -13,5 +13,5 @@ pub mod order;
 
 // Re-exports
 pub use storage::StrategyStorage;
-pub use manager::{StrategyRunner, InstanceInfo};
+pub use manager::{StrategyRunner};
 pub use order::init_trading;

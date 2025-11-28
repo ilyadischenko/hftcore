@@ -15,15 +15,12 @@ use serde::Serialize;
 use crate::ffi_types::CEvent;
 use crate::strategies::order::{PlaceOrderFn, CancelOrderFn, place_order, cancel_order};
 
-// ═══════════════════════════════════════════════════════════
-// FFI
-// ═══════════════════════════════════════════════════════════
-
 #[repr(C)]
 pub struct StrategyConfig {
     pub symbol: [u8; 32],
     pub symbol_len: u8,
     pub params_json: *const std::os::raw::c_char,
+    pub stop_flag: *const AtomicBool,
 }
 
 type RunFn = unsafe extern "C" fn(
@@ -32,12 +29,6 @@ type RunFn = unsafe extern "C" fn(
     cancel_order: CancelOrderFn,
     config: StrategyConfig,
 ) -> i32;
-
-type StopFn = unsafe extern "C" fn();
-
-// ═══════════════════════════════════════════════════════════
-// INSTANCE INFO (публичный)
-// ═══════════════════════════════════════════════════════════
 
 #[derive(Debug, Clone, Serialize)]
 pub struct InstanceInfo {
@@ -48,22 +39,13 @@ pub struct InstanceInfo {
     pub started_at: i64,
 }
 
-// ═══════════════════════════════════════════════════════════
-// INTERNAL
-// ═══════════════════════════════════════════════════════════
-
 struct RunningInstance {
     info: InstanceInfo,
     _lib: Arc<Library>,
-    stop_fn: StopFn,
+    stop_flag: Arc<AtomicBool>,
     task: JoinHandle<i32>,
     bridge_task: JoinHandle<()>,
-    shutdown: Arc<AtomicBool>,
 }
-
-// ═══════════════════════════════════════════════════════════
-// RUNNER
-// ═══════════════════════════════════════════════════════════
 
 pub struct StrategyRunner {
     instances: Arc<DashMap<String, RunningInstance>>,
@@ -75,31 +57,75 @@ impl StrategyRunner {
             instances: Arc::new(DashMap::new()),
         });
         
-        // Фоновая очистка завершённых
         let instances = runner.instances.clone();
         tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-                
-                let finished: Vec<_> = instances.iter()
-                    .filter(|e| e.value().task.is_finished())
-                    .map(|e| e.key().clone())
-                    .collect();
-                
-                for id in finished {
-                    if let Some((_, inst)) = instances.remove(&id) {
-                        let code = inst.task.await.ok();
-                        inst.bridge_task.abort();
-                        tracing::info!("🧹 Cleaned '{}' (exit: {:?})", id, code);
-                    }
-                }
-            }
+            tracing::info!("🧹 Cleanup loop started");
+            Self::cleanup_loop(instances).await;
         });
         
         runner
     }
     
-    /// Запустить инстанс: strategy_id + symbol → instance_id
+    async fn cleanup_loop(instances: Arc<DashMap<String, RunningInstance>>) {
+        let mut check_count = 0u64;
+        
+        loop {
+            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+            check_count += 1;
+            
+            // Логируем каждые 10 секунд что cleanup работает
+            if check_count % 10 == 0 {
+                let count = instances.len();
+                if count > 0 {
+                    tracing::debug!("🧹 Cleanup check #{}: {} instances", check_count, count);
+                }
+            }
+            
+            // Собираем завершённые
+            let mut finished = Vec::new();
+            
+            for entry in instances.iter() {
+                let id = entry.key();
+                let inst = entry.value();
+                
+                let task_finished = inst.task.is_finished();
+                let bridge_finished = inst.bridge_task.is_finished();
+                
+                if task_finished {
+                    tracing::info!(
+                        "🔍 Instance '{}': task={}, bridge={}", 
+                        id, 
+                        if task_finished { "DONE" } else { "running" },
+                        if bridge_finished { "DONE" } else { "running" }
+                    );
+                    finished.push(id.clone());
+                }
+            }
+            
+            // Удаляем завершённые
+            for id in finished {
+                if let Some((_, inst)) = instances.remove(&id) {
+                    // Останавливаем bridge если ещё работает
+                    if !inst.bridge_task.is_finished() {
+                        inst.stop_flag.store(true, Ordering::Relaxed);
+                        inst.bridge_task.abort();
+                    }
+                    
+                    // Получаем exit code
+                    let code = match inst.task.await {
+                        Ok(c) => Some(c),
+                        Err(e) => {
+                            tracing::error!("❌ Task '{}' panicked: {:?}", id, e);
+                            None
+                        }
+                    };
+                    
+                    tracing::info!("🧹 Cleaned '{}' (exit: {:?})", id, code);
+                }
+            }
+        }
+    }
+    
     pub async fn start(
         &self,
         strategy_id: String,
@@ -118,22 +144,19 @@ impl StrategyRunner {
         
         tracing::info!("📦 Starting '{}' with params: {}", instance_id, params_json);
         
-        // Загружаем библиотеку
         let lib: Arc<Library> = Arc::new(unsafe { Library::new(&lib_path)? });
         let run_fn: RunFn = unsafe { *lib.get(b"run")? };
-        let stop_fn: StopFn = unsafe { *lib.get(b"stop")? };
         
-        // Каналы
         let (sync_tx, sync_rx) = bounded::<CEvent>(8192);
-        let shutdown = Arc::new(AtomicBool::new(false));
+        let stop_flag = Arc::new(AtomicBool::new(false));
         
         // Bridge task
         let bridge_task = {
             let instance_id = instance_id.clone();
-            let shutdown = shutdown.clone();
+            let stop_flag = stop_flag.clone();
             
             tokio::spawn(async move {
-                Self::bridge_loop(instance_id, event_rx, sync_tx, shutdown).await;
+                Self::bridge_loop(instance_id, event_rx, sync_tx, stop_flag).await;
             })
         };
         
@@ -142,9 +165,21 @@ impl StrategyRunner {
             let instance_id = instance_id.clone();
             let symbol = symbol.clone();
             let lib = lib.clone();
+            let stop_flag = stop_flag.clone();
             
             tokio::task::spawn_blocking(move || {
-                Self::run_strategy(instance_id, lib, run_fn, sync_rx, symbol, params_json)
+                let result = Self::run_strategy(
+                    instance_id.clone(), 
+                    lib, 
+                    run_fn, 
+                    sync_rx, 
+                    symbol, 
+                    params_json,
+                    stop_flag,
+                );
+                
+                tracing::info!("📤 Task '{}' returning {}", instance_id, result);
+                result
             })
         };
         
@@ -159,10 +194,9 @@ impl StrategyRunner {
         self.instances.insert(instance_id.clone(), RunningInstance {
             info: info.clone(),
             _lib: lib,
-            stop_fn,
+            stop_flag,
             task,
             bridge_task,
-            shutdown,
         });
         
         tracing::info!("✅ Instance '{}' started", instance_id);
@@ -173,17 +207,23 @@ impl StrategyRunner {
         instance_id: String,
         mut event_rx: broadcast::Receiver<CEvent>,
         sync_tx: Sender<CEvent>,
-        shutdown: Arc<AtomicBool>,
+        stop_flag: Arc<AtomicBool>,
     ) {
+        tracing::debug!("🌉 Bridge '{}' started", instance_id);
         let mut dropped = 0u64;
         
         loop {
-            if shutdown.load(Ordering::Relaxed) {
+            if stop_flag.load(Ordering::Relaxed) {
+                tracing::debug!("🌉 Bridge '{}' stopping (flag)", instance_id);
                 break;
             }
             
-            match event_rx.recv().await {
-                Ok(event) => {
+            // Используем select с таймаутом чтобы проверять флаг
+            match tokio::time::timeout(
+                tokio::time::Duration::from_millis(100),
+                event_rx.recv()
+            ).await {
+                Ok(Ok(event)) => {
                     if sync_tx.try_send(event).is_err() {
                         dropped += 1;
                         if dropped % 1000 == 0 {
@@ -191,12 +231,20 @@ impl StrategyRunner {
                         }
                     }
                 }
-                Err(broadcast::error::RecvError::Closed) => break,
-                Err(broadcast::error::RecvError::Lagged(n)) => {
+                Ok(Err(broadcast::error::RecvError::Closed)) => {
+                    tracing::debug!("🌉 Bridge '{}' stopping (closed)", instance_id);
+                    break;
+                }
+                Ok(Err(broadcast::error::RecvError::Lagged(n))) => {
                     tracing::warn!("'{}' lagged {} msgs", instance_id, n);
+                }
+                Err(_) => {
+                    // Таймаут - проверяем флаг на следующей итерации
                 }
             }
         }
+        
+        tracing::debug!("🌉 Bridge '{}' stopped", instance_id);
     }
     
     fn run_strategy(
@@ -206,6 +254,7 @@ impl StrategyRunner {
         sync_rx: Receiver<CEvent>,
         symbol: String,
         params_json: String,
+        stop_flag: Arc<AtomicBool>,
     ) -> i32 {
         tracing::info!("🚀 Strategy thread '{}' started", instance_id);
         
@@ -220,11 +269,15 @@ impl StrategyRunner {
             symbol: symbol_bytes,
             symbol_len: len as u8,
             params_json: params_cstring.as_ptr(),
+            stop_flag: Arc::as_ptr(&stop_flag),
         };
         
         let rx_ptr = Box::into_raw(Box::new(sync_rx));
         
         let result = unsafe { run_fn(rx_ptr, place_order, cancel_order, config) };
+        
+        // Ставим флаг чтобы bridge остановился
+        stop_flag.store(true, Ordering::Relaxed);
         
         unsafe { let _ = Box::from_raw(rx_ptr); }
         drop(lib);
@@ -233,34 +286,34 @@ impl StrategyRunner {
         result
     }
     
-    /// Остановить конкретный инстанс
     pub async fn stop(&self, instance_id: &str) -> Result<()> {
         let entry = self.instances.get(instance_id)
             .ok_or_else(|| anyhow::anyhow!("Instance '{}' not found", instance_id))?;
         
         tracing::info!("🛑 Stopping '{}'...", instance_id);
         
-        entry.shutdown.store(true, Ordering::Relaxed);
-        unsafe { (entry.stop_fn)(); }
+        entry.stop_flag.store(true, Ordering::Relaxed);
         
         drop(entry);
         
         // Ждём очистки
-        for _ in 0..100 {
+        for i in 0..100 {
             if !self.instances.contains_key(instance_id) {
-                tracing::info!("✅ '{}' stopped", instance_id);
+                tracing::info!("✅ '{}' stopped after {}ms", instance_id, i * 100);
                 return Ok(());
             }
             tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
         }
         
         // Force remove
-        self.instances.remove(instance_id);
-        tracing::warn!("⚠️ '{}' force removed", instance_id);
+        if let Some((_, inst)) = self.instances.remove(instance_id) {
+            inst.bridge_task.abort();
+            tracing::warn!("⚠️ '{}' force removed", instance_id);
+        }
+        
         Ok(())
     }
     
-    /// Остановить все инстансы стратегии
     pub async fn stop_all(&self, strategy_id: &str) -> Vec<String> {
         let to_stop: Vec<_> = self.instances.iter()
             .filter(|e| e.value().info.strategy_id == strategy_id)
@@ -274,14 +327,10 @@ impl StrategyRunner {
         to_stop
     }
     
-    /// Список всех запущенных инстансов
     pub fn list(&self) -> Vec<InstanceInfo> {
-        self.instances.iter()
-            .map(|e| e.value().info.clone())
-            .collect()
+        self.instances.iter().map(|e| e.value().info.clone()).collect()
     }
     
-    /// Инстансы конкретной стратегии
     pub fn list_for(&self, strategy_id: &str) -> Vec<InstanceInfo> {
         self.instances.iter()
             .filter(|e| e.value().info.strategy_id == strategy_id)
@@ -289,7 +338,6 @@ impl StrategyRunner {
             .collect()
     }
     
-    /// Получить информацию об инстансе
     pub fn get(&self, instance_id: &str) -> Option<InstanceInfo> {
         self.instances.get(instance_id).map(|e| e.value().info.clone())
     }

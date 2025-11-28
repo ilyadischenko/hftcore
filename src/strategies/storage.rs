@@ -190,27 +190,27 @@ impl StrategyStorage {
         }
     }
     
-    pub fn check(&self, id: &str) -> Result<CompilationResult> {
-        let dir = self.base_path.join(id);
-        if !dir.exists() {
-            anyhow::bail!("Strategy '{}' not found", id);
-        }
+    // pub fn check(&self, id: &str) -> Result<CompilationResult> {
+    //     let dir = self.base_path.join(id);
+    //     if !dir.exists() {
+    //         anyhow::bail!("Strategy '{}' not found", id);
+    //     }
         
-        let output = Command::new("cargo")
-            .args(["check", "--manifest-path"])
-            .arg(dir.join("Cargo.toml"))
-            .output()?;
+    //     let output = Command::new("cargo")
+    //         .args(["check", "--manifest-path"])
+    //         .arg(dir.join("Cargo.toml"))
+    //         .output()?;
         
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let combined = format!("{}\n{}", String::from_utf8_lossy(&output.stdout), stderr);
+    //     let stderr = String::from_utf8_lossy(&output.stderr);
+    //     let combined = format!("{}\n{}", String::from_utf8_lossy(&output.stdout), stderr);
         
-        Ok(CompilationResult {
-            success: output.status.success(),
-            lib_path: None,
-            output: combined,
-            errors: if output.status.success() { vec![] } else { self.parse_errors(&stderr) },
-        })
-    }
+    //     Ok(CompilationResult {
+    //         success: output.status.success(),
+    //         lib_path: None,
+    //         output: combined,
+    //         errors: if output.status.success() { vec![] } else { self.parse_errors(&stderr) },
+    //     })
+    // }
     
     pub fn get_lib_path(&self, id: &str) -> Result<PathBuf> {
         let dir = self.base_path.join(id);

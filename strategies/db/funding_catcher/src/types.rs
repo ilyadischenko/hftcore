@@ -1,7 +1,7 @@
 // Auto-generated types - DO NOT EDIT
 // Copied from template at strategy creation
 use std::os::raw::c_char;
-
+use std::sync::atomic::{AtomicBool, Ordering};
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct CEvent {
@@ -82,29 +82,27 @@ pub type CancelOrderFn = unsafe extern "C" fn(
 
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
 pub struct StrategyConfig {
-    pub symbol: [u8; 16],           // "SOLUSDT"
+    pub symbol: [u8; 32],
     pub symbol_len: u8,
-    pub params_json: *const c_char, // JSON строка с параметрами
+    pub params_json: *const std::os::raw::c_char,
+    pub stop_flag: *const AtomicBool,
 }
 
 impl StrategyConfig {
-    pub fn symbol_str(&self) -> &str {
+    pub fn symbol(&self) -> &str {
         unsafe { std::str::from_utf8_unchecked(&self.symbol[..self.symbol_len as usize]) }
     }
     
-    /// Парсинг JSON параметров в любую структуру
-    pub fn parse_params<T: serde::de::DeserializeOwned>(&self) -> Result<T, serde_json::Error> {
-        if self.params_json.is_null() {
-            // Пустой JSON объект по умолчанию
-            return serde_json::from_str("{}");
-        }
-        
+    pub fn should_stop(&self) -> bool {
+        unsafe { (*self.stop_flag).load(Ordering::Relaxed) }
+    }
+    
+    pub fn params_raw(&self) -> &str {
         unsafe {
-            let c_str = std::ffi::CStr::from_ptr(self.params_json);
-            let json_str = c_str.to_str().unwrap_or("{}");
-            serde_json::from_str(json_str)
+            std::ffi::CStr::from_ptr(self.params_json)
+                .to_str()
+                .unwrap_or("{}")
         }
     }
 }

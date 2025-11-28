@@ -116,20 +116,20 @@ pub fn routes(state: AppState) -> Router {
         // Стратегии
         .route("/strategies", get(list_strategies))
         .route("/strategies", post(create_strategy))
-        .route("/strategies/{id}", get(get_strategy))
-        .route("/strategies/{id}", delete(delete_strategy))
-        .route("/strategies/{id}/code", put(update_code))
-        .route("/strategies/{id}/compile", post(compile))
+        .route("/strategies/:id", get(get_strategy))
+        .route("/strategies/:id", delete(delete_strategy))
+        .route("/strategies/:id/code", put(update_code))
+        .route("/strategies/:id/compile", post(compile))
         
         // Запуск/остановка
-        .route("/strategies/{id}/start", post(start))
-        .route("/strategies/{id}/stop", post(stop_all))
-        .route("/strategies/{id}/stop/{symbol}", post(stop_one))
+        .route("/strategies/:id/start", post(start))
+        .route("/strategies/:id/stop", post(stop_all))
+        .route("/strategies/:id/stop/:symbol", post(stop_one))
         
         // Инстансы
         .route("/instances", get(list_instances))
-        .route("/instances/{instance_id}", get(get_instance))
-        .route("/instances/{instance_id}/stop", post(stop_instance))
+        .route("/instances/:instance_id/stop", post(stop_instance))
+        .route("/instances/:instance_id", get(get_instance))
         
         .with_state(state)
 }
@@ -168,6 +168,7 @@ async fn get_strategy(
     State(s): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<(StatusCode, Json<ApiResult<StrategyDetail>>), (StatusCode, Json<ApiResult<StrategyDetail>>)> {
+    tracing::info!("Fetch strategy {}", id);
     let code = s.storage.get_code(&id)
         .map_err(|e| ApiResult::<StrategyDetail>::err(StatusCode::NOT_FOUND, e.to_string()))?;
     
@@ -181,6 +182,7 @@ async fn delete_strategy(
     State(s): State<AppState>,
     Path(id): Path<String>,
 ) -> (StatusCode, Json<ApiResult>) {
+    tracing::info!("Deleting strategy {}", id);
     s.runner.stop_all(&id).await;
     
     match s.storage.delete(&id) {
@@ -233,6 +235,7 @@ async fn start(
     if !s.storage.exists(&id) {
         return ApiResult::err(StatusCode::NOT_FOUND, "Strategy not found");
     }
+    tracing::info!("Starting strategy {} on {}", id, req.symbol);
     
     let lib_path = match s.storage.get_lib_path(&id) {
         Ok(p) => p,
