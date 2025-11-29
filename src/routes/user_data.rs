@@ -2,14 +2,15 @@
 
 use axum::{
     routing::{get, post, delete},
-    extract::{Json, State, Path},
+    extract::{Json, State},
     Router,
     http::StatusCode,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
-use crate::user_data::{UserDataManager, StreamInfo};
+// Импортируем StreamInfo из user_data::manager
+use crate::user_data::manager::{UserDataManager, StreamInfo};
 
 #[derive(Clone)]
 pub struct UserDataState {
@@ -56,6 +57,7 @@ pub fn routes(state: UserDataState) -> Router {
 }
 
 async fn list_streams(State(s): State<UserDataState>) -> Json<Vec<StreamInfo>> {
+    // Просто возвращаем список, который генерирует manager
     Json(s.manager.list())
 }
 
@@ -63,6 +65,7 @@ async fn connect_stream(
     State(s): State<UserDataState>,
     Json(req): Json<ConnectRequest>,
 ) -> (StatusCode, Json<ApiResult<StreamInfo>>) {
+    // Connect теперь возвращает Receiver<CEvent>, но для API нам важен только факт успеха
     match s.manager.connect(req.api_key.clone(), req.secret_key).await {
         Ok(_) => {
             let streams = s.manager.list();

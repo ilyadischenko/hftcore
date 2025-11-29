@@ -123,19 +123,6 @@ impl CEvent {
     pub fn as_account(&self) -> Option<&CAccountUpdate> {
         if self.event_type == 3 { unsafe { Some(&self.data.account) } } else { None }
     }
-
-    #[inline(always)]
-    pub fn as_funding(&self) -> Option<&CAccountUpdate> {
-        if self.event_type == 3 { 
-            unsafe {
-                // Код 4 = FUNDING_FEE (согласно нашему парсеру)
-                if self.data.account.reason_code == 4 {
-                    return Some(&self.data.account);
-                }
-            }
-        }
-        None
-    }
 }
 
 impl CBookTicker {

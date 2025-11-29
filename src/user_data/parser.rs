@@ -1,162 +1,193 @@
 // src/user_data/parser.rs
 
-use super::types::*;
-use serde_json::Value;
+use simd_json::serde as simd_serde;
+use serde::Deserialize;
+use crate::ffi_types::*;
 
-pub fn parse_message(text: &str) -> Option<UserDataEvent> {
-    let json: Value = serde_json::from_str(text).ok()?;
-    
-    match json.get("e")?.as_str()? {
-        "ORDER_TRADE_UPDATE" => parse_order_update(&json),
-        "ACCOUNT_UPDATE" => parse_account_update(&json),
-        "MARGIN_CALL" => parse_margin_call(&json),
-        _ => Some(UserDataEvent::Unknown { raw: text.to_string() }),
+// ═══════════════════════════════════════════════════════════
+// ВРЕМЕННЫЕ СТРУКТУРЫ (Zero-copy маппинг)
+// ═══════════════════════════════════════════════════════════
+
+#[derive(Deserialize)]
+struct RawOrderEvent {
+    #[serde(rename = "E")] event_time: i64,
+    #[serde(rename = "o")] order: RawOrderData,
+}
+
+#[derive(Deserialize)]
+struct RawOrderData {
+    #[serde(rename = "s")] symbol: String,
+    #[serde(rename = "c")] client_id: String,
+    #[serde(rename = "S")] side: String,
+    #[serde(rename = "X")] status: String,
+    #[serde(rename = "i")] order_id: i64,
+    #[serde(rename = "q")] original_qty: String,
+    #[serde(rename = "p")] original_price: String,
+    #[serde(rename = "ap")] avg_price: String,
+    #[serde(rename = "z")] accumulated_qty: String,
+    #[serde(rename = "n")] commission: Option<String>,
+    #[serde(rename = "T")] trade_time: i64,
+}
+
+#[derive(Deserialize)]
+struct RawAccountEvent {
+    #[serde(rename = "E")] event_time: i64,
+    #[serde(rename = "a")] data: RawAccountData,
+}
+
+#[derive(Deserialize)]
+struct RawAccountData {
+    #[serde(rename = "m")] reason: String,
+    #[serde(rename = "B")] balances: Vec<RawBalance>,
+}
+
+#[derive(Deserialize)]
+struct RawBalance {
+    #[serde(rename = "a")] asset: String,
+    #[serde(rename = "wb")] wallet_balance: String,
+    #[serde(rename = "cw")] cross_wallet_balance: String,
+    #[serde(rename = "bc")] balance_change: String,
+}
+
+// ═══════════════════════════════════════════════════════════
+// PARSER ENTRY POINT
+// ═══════════════════════════════════════════════════════════
+
+/// Парсит входящий JSON-буфер и возвращает CEvent.
+/// ВНИМАНИЕ: Буфер `buffer` будет модифицирован simd_json!
+pub fn parse_to_c_event(buffer: &mut [u8]) -> Option<CEvent> {
+    // Быстрая проверка типа события (сканирование байт без парсинга)
+    if has_substring(buffer, b"ORDER_TRADE_UPDATE") {
+        parse_order(buffer)
+    } else if has_substring(buffer, b"ACCOUNT_UPDATE") {
+        parse_account(buffer)
+    } else {
+        // Остальные события (MarginCall и т.д.) пока игнорируем для скорости
+        None
     }
 }
 
-fn parse_order_update(json: &Value) -> Option<UserDataEvent> {
-    let o = json.get("o")?;
+fn parse_order(buffer: &mut [u8]) -> Option<CEvent> {
+    // simd_serde::from_slice использует вектор инструкций CPU для парсинга
+    let raw: RawOrderEvent = simd_serde::from_slice(buffer).ok()?;
     
-    let order = OrderInfo {
-        symbol: o.get("s")?.as_str()?.to_string(),
-        order_id: o.get("i")?.as_i64()?,
-        client_order_id: o.get("c")?.as_str()?.to_string(),
-        side: match o.get("S")?.as_str()? {
-            "BUY" => OrderSide::Buy,
-            _ => OrderSide::Sell,
-        },
-        order_type: match o.get("o")?.as_str()? {
-            "LIMIT" => OrderType::Limit,
-            "MARKET" => OrderType::Market,
-            "STOP" => OrderType::Stop,
-            "STOP_MARKET" => OrderType::StopMarket,
-            "TAKE_PROFIT" => OrderType::TakeProfit,
-            "TAKE_PROFIT_MARKET" => OrderType::TakeProfitMarket,
-            "TRAILING_STOP_MARKET" => OrderType::TrailingStopMarket,
-            _ => OrderType::Other,
-        },
-        status: match o.get("X")?.as_str()? {
-            "NEW" => OrderStatus::New,
-            "PARTIALLY_FILLED" => OrderStatus::PartiallyFilled,
-            "FILLED" => OrderStatus::Filled,
-            "CANCELED" => OrderStatus::Canceled,
-            "REJECTED" => OrderStatus::Rejected,
-            "EXPIRED" => OrderStatus::Expired,
-            _ => OrderStatus::Unknown,
-        },
-        price: parse_f64(o, "p"),
-        quantity: parse_f64(o, "q"),
-        stop_price: parse_f64(o, "sp"),
-        time_in_force: o.get("f").and_then(|v| v.as_str()).unwrap_or("GTC").to_string(),
-        last_filled_qty: parse_f64(o, "l"),
-        last_filled_price: parse_f64(o, "L"),
-        cumulative_qty: parse_f64(o, "z"),
-        average_price: parse_f64(o, "ap"),
-        commission: parse_f64(o, "n"),
-        commission_asset: o.get("N").and_then(|v| v.as_str()).map(String::from),
-        order_time: o.get("T")?.as_u64()?,
-        trade_time: o.get("T").and_then(|v| v.as_u64()).unwrap_or(0),
-        trade_id: o.get("t").and_then(|v| v.as_i64()).unwrap_or(0),
-        realized_pnl: parse_f64(o, "rp"),
+    let mut c_order = COrderUpdate {
+        symbol: [0; 16],
+        symbol_len: 0,
+        client_order_id: [0; 32],
+        client_order_id_len: 0,
+        order_id: raw.order.order_id,
+        price: parse_f64(&raw.order.original_price),
+        qty: parse_f64(&raw.order.original_qty),
+        avg_price: parse_f64(&raw.order.avg_price),
+        accumulated_qty: parse_f64(&raw.order.accumulated_qty),
+        commission: raw.order.commission.as_deref().map(parse_f64).unwrap_or(0.0),
+        
+        // Берем первую букву статуса и стороны ('N', 'F', 'C' / 'B', 'S')
+        status_char: raw.order.status.as_bytes().first().copied().unwrap_or(b'?'),
+        side_char: raw.order.side.as_bytes().first().copied().unwrap_or(b'?'),
+        
+        event_time: raw.event_time,
+        trade_time: raw.order.trade_time,
     };
-    
-    Some(UserDataEvent::OrderUpdate(OrderUpdateEvent {
-        event_time: json.get("E")?.as_u64()?,
-        transaction_time: json.get("T")?.as_u64()?,
-        order,
-    }))
+
+    // Копируем строки в фиксированные буферы
+    copy_str(&mut c_order.symbol, &mut c_order.symbol_len, &raw.order.symbol);
+    copy_str(&mut c_order.client_order_id, &mut c_order.client_order_id_len, &raw.order.client_id);
+
+    Some(CEvent {
+        event_type: 2, // 2 = User Order Update
+        data: CEventData { order: c_order },
+        received_at_ns: get_current_ts_ns(),
+    })
 }
 
-fn parse_account_update(json: &Value) -> Option<UserDataEvent> {
-    let a = json.get("a")?;
+fn parse_account(buffer: &mut [u8]) -> Option<CEvent> {
+    let raw: RawAccountEvent = simd_serde::from_slice(buffer).ok()?;
     
-    let reason = match a.get("m")?.as_str()? {
-        "DEPOSIT" => UpdateReason::Deposit,
-        "WITHDRAW" => UpdateReason::Withdraw,
-        "ORDER" => UpdateReason::Order,
-        "FUNDING_FEE" => UpdateReason::FundingFee,
-        "WITHDRAW_REJECT" => UpdateReason::WithdrawReject,
-        "ADJUSTMENT" => UpdateReason::Adjustment,
-        "INSURANCE_CLEAR" => UpdateReason::InsuranceClear,
-        "ADMIN_DEPOSIT" => UpdateReason::AdminDeposit,
-        "ADMIN_WITHDRAW" => UpdateReason::AdminWithdraw,
-        "MARGIN_TRANSFER" => UpdateReason::MarginTransfer,
-        "MARGIN_TYPE_CHANGE" => UpdateReason::MarginTypeChange,
-        "ASSET_TRANSFER" => UpdateReason::AssetTransfer,
-        "OPTIONS_PREMIUM_FEE" => UpdateReason::OptionsPremiumFee,
-        "OPTIONS_SETTLE_PROFIT" => UpdateReason::OptionsSettleProfit,
-        "AUTO_EXCHANGE" => UpdateReason::AutoExchange,
-        _ => UpdateReason::Unknown,
+    // Если балансы не менялись (пустой массив), событие не нужно стратегии
+    if raw.data.balances.is_empty() {
+        return None;
+    }
+
+    let mut c_acc = CAccountUpdate {
+        event_time: raw.event_time,
+        reason_code: map_reason(&raw.data.reason),
+        balances_count: 0,
+        balances: [CBalanceItem {
+            asset: [0; 8], asset_len: 0,
+            wallet_balance: 0.0, cross_wallet_balance: 0.0, balance_change: 0.0
+        }; 10],
     };
-    
-    let balances: Vec<BalanceInfo> = a.get("B")
-        .and_then(|b| b.as_array())
-        .map(|arr| {
-            arr.iter().filter_map(|b| {
-                Some(BalanceInfo {
-                    asset: b.get("a")?.as_str()?.to_string(),
-                    wallet_balance: parse_f64(b, "wb"),
-                    cross_wallet_balance: parse_f64(b, "cw"),
-                    balance_change: parse_f64(b, "bc"),
-                })
-            }).collect()
-        })
-        .unwrap_or_default();
-    
-    let positions: Vec<PositionInfo> = a.get("P")
-        .and_then(|p| p.as_array())
-        .map(|arr| {
-            arr.iter().filter_map(|p| {
-                Some(PositionInfo {
-                    symbol: p.get("s")?.as_str()?.to_string(),
-                    position_amount: parse_f64(p, "pa"),
-                    entry_price: parse_f64(p, "ep"),
-                    unrealized_pnl: parse_f64(p, "up"),
-                    margin_type: p.get("mt")?.as_str()?.to_string(),
-                    isolated_wallet: parse_f64(p, "iw"),
-                    position_side: p.get("ps")?.as_str()?.to_string(),
-                })
-            }).collect()
-        })
-        .unwrap_or_default();
-    
-    Some(UserDataEvent::AccountUpdate(AccountUpdateEvent {
-        event_time: json.get("E")?.as_u64()?,
-        transaction_time: json.get("T")?.as_u64()?,
-        reason,
-        balances,
-        positions,
-    }))
+
+    // Заполняем до 10 изменений баланса
+    let count = raw.data.balances.len().min(10);
+    c_acc.balances_count = count as u8;
+
+    for i in 0..count {
+        let src = &raw.data.balances[i];
+        let dst = &mut c_acc.balances[i];
+        
+        copy_str(&mut dst.asset, &mut dst.asset_len, &src.asset);
+        dst.wallet_balance = parse_f64(&src.wallet_balance);
+        dst.cross_wallet_balance = parse_f64(&src.cross_wallet_balance);
+        dst.balance_change = parse_f64(&src.balance_change);
+    }
+
+    Some(CEvent {
+        event_type: 3, // 3 = User Account Update
+        data: CEventData { account: c_acc },
+        received_at_ns: get_current_ts_ns(),
+    })
 }
 
-fn parse_margin_call(json: &Value) -> Option<UserDataEvent> {
-    let positions: Vec<MarginCallPosition> = json.get("p")
-        .and_then(|p| p.as_array())
-        .map(|arr| {
-            arr.iter().filter_map(|p| {
-                Some(MarginCallPosition {
-                    symbol: p.get("s")?.as_str()?.to_string(),
-                    position_side: p.get("ps")?.as_str()?.to_string(),
-                    position_amount: parse_f64(p, "pa"),
-                    margin_type: p.get("mt")?.as_str()?.to_string(),
-                    mark_price: parse_f64(p, "mp"),
-                    unrealized_pnl: parse_f64(p, "up"),
-                    maintenance_margin: parse_f64(p, "mm"),
-                })
-            }).collect()
-        })
-        .unwrap_or_default();
-    
-    Some(UserDataEvent::MarginCall(MarginCallEvent {
-        event_time: json.get("E")?.as_u64()?,
-        cross_wallet_balance: parse_f64(json, "cw"),
-        positions,
-    }))
+// ═══════════════════════════════════════════════════════════
+// HELPERS (Inlined for speed)
+// ═══════════════════════════════════════════════════════════
+
+#[inline(always)]
+fn has_substring(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack.windows(needle.len()).any(|window| window == needle)
 }
 
-fn parse_f64(v: &Value, key: &str) -> f64 {
-    v.get(key)
-        .and_then(|x| x.as_str())
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0.0)
+#[inline(always)]
+fn parse_f64(s: &str) -> f64 {
+    // Обычный parse достаточно быстр для строк, уже выделенных в JSON
+    s.parse().unwrap_or(0.0)
+}
+
+#[inline(always)]
+fn copy_str<const N: usize>(dst: &mut [u8; N], len: &mut u8, src: &str) {
+    let bytes = src.as_bytes();
+    *len = bytes.len().min(N) as u8;
+    dst[..*len as usize].copy_from_slice(&bytes[..*len as usize]);
+}
+
+#[inline(always)]
+fn get_current_ts_ns() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64
+}
+
+fn map_reason(r: &str) -> u8 {
+    match r {
+        "DEPOSIT" => 1,
+        "WITHDRAW" => 2,
+        "ORDER" => 3,
+        "FUNDING_FEE" => 4,
+        "WITHDRAW_REJECT" => 5,
+        "ADJUSTMENT" => 6,
+        "INSURANCE_CLEAR" => 7,
+        "ADMIN_DEPOSIT" => 8,
+        "ADMIN_WITHDRAW" => 9,
+        "MARGIN_TRANSFER" => 10,
+        "MARGIN_TYPE_CHANGE" => 11,
+        "ASSET_TRANSFER" => 12,
+        "OPTIONS_PREMIUM_FEE" => 13,
+        "OPTIONS_SETTLE_PROFIT" => 14,
+        "AUTO_EXCHANGE" => 15,
+        _ => 0,
+    }
 }
