@@ -17,12 +17,15 @@ mod exchange_data;
 mod exchange_trade;
 mod routes;
 mod strategies;
+mod user_data;
 
 use crate::exchange_data::ExchangeData;
 use crate::exchange_trade::ExchangeTrade;
 use crate::routes::strategy::{self, AppState};
+use crate::routes::user_data::{routes as user_data_routes, UserDataState};
 use crate::strategies::{StrategyStorage, StrategyRunner};
 use crate::strategies::init_trading;
+use crate::user_data::UserDataManager;
 use crate::ffi_types::CEvent;
 
 // ═══════════════════════════════════════════════════════════
@@ -130,6 +133,13 @@ async fn main() {
     init_trading(trade_manager.clone());
 
     // ═══════════════════════════════════════════════════════════
+    // USER DATA MANAGER
+    // ═══════════════════════════════════════════════════════════
+
+    let user_data_manager = UserDataManager::new();
+
+
+    // ═══════════════════════════════════════════════════════════
     // STRATEGY STORAGE & RUNNER
     // ═══════════════════════════════════════════════════════════
     
@@ -138,7 +148,8 @@ async fn main() {
             .expect("Failed to create strategy storage")
     );
     
-    let runner = StrategyRunner::new();
+    // let runner = StrategyRunner::new();
+    let runner = StrategyRunner::new(user_data_manager.clone());  // ← Передаём manager
 
     // ═══════════════════════════════════════════════════════════
     // STATES
@@ -154,6 +165,10 @@ async fn main() {
         storage,
         runner,
         event_tx,
+    };
+
+    let user_data_state = UserDataState {
+        manager: user_data_manager,
     };
 
     // ═══════════════════════════════════════════════════════════
@@ -173,12 +188,14 @@ async fn main() {
     
     let app = Router::new()
         .merge(data_routes)
-        .nest("/api", strategy::routes(strategy_state));
+        .nest("/api", strategy::routes(strategy_state))
+        .nest("/api", user_data_routes(user_data_state));
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await.unwrap();
     tracing::info!("🚀 Server running on http://0.0.0.0:8080");
     tracing::info!("📚 Strategy API at /api/strategies");
     tracing::info!("📊 Instances API at /api/instances");
+    tracing::info!("📡 User Data API at /api/userdata/streams");
     axum::serve(listener, app).await.unwrap();
 }
 

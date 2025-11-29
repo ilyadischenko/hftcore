@@ -14,6 +14,13 @@ use serde::Serialize;
 
 use crate::ffi_types::CEvent;
 use crate::strategies::order::{PlaceOrderFn, CancelOrderFn, place_order, cancel_order};
+use crate::user_data::{UserDataManager, UserDataEvent};
+
+// ═══════════════════════════════════════════════════════════
+// FFI TYPES
+// ═══════════════════════════════════════════════════════════
+
+pub type UserDataReceiverHolder = std::sync::Mutex<Option<broadcast::Receiver<UserDataEvent>>>;
 
 #[repr(C)]
 pub struct StrategyConfig {
@@ -21,6 +28,7 @@ pub struct StrategyConfig {
     pub symbol_len: u8,
     pub params_json: *const std::os::raw::c_char,
     pub stop_flag: *const AtomicBool,
+    pub user_data_rx: *const UserDataReceiverHolder,
 }
 
 type RunFn = unsafe extern "C" fn(
@@ -30,6 +38,10 @@ type RunFn = unsafe extern "C" fn(
     config: StrategyConfig,
 ) -> i32;
 
+// ═══════════════════════════════════════════════════════════
+// INSTANCE INFO
+// ═══════════════════════════════════════════════════════════
+
 #[derive(Debug, Clone, Serialize)]
 pub struct InstanceInfo {
     pub instance_id: String,
@@ -37,7 +49,12 @@ pub struct InstanceInfo {
     pub symbol: String,
     pub params: serde_json::Value,
     pub started_at: i64,
+    pub has_user_data: bool,
 }
+
+// ═══════════════════════════════════════════════════════════
+// RUNNING INSTANCE
+// ═══════════════════════════════════════════════════════════
 
 struct RunningInstance {
     info: InstanceInfo,
@@ -45,16 +62,23 @@ struct RunningInstance {
     stop_flag: Arc<AtomicBool>,
     task: JoinHandle<i32>,
     bridge_task: JoinHandle<()>,
+    _user_data_holder: Option<Arc<UserDataReceiverHolder>>,
 }
+
+// ═══════════════════════════════════════════════════════════
+// STRATEGY RUNNER
+// ═══════════════════════════════════════════════════════════
 
 pub struct StrategyRunner {
     instances: Arc<DashMap<String, RunningInstance>>,
+    user_data_manager: Arc<UserDataManager>,
 }
 
 impl StrategyRunner {
-    pub fn new() -> Arc<Self> {
+    pub fn new(user_data_manager: Arc<UserDataManager>) -> Arc<Self> { 
         let runner = Arc::new(Self {
             instances: Arc::new(DashMap::new()),
+            user_data_manager,
         });
         
         let instances = runner.instances.clone();
@@ -73,7 +97,6 @@ impl StrategyRunner {
             tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
             check_count += 1;
             
-            // Логируем каждые 10 секунд что cleanup работает
             if check_count % 10 == 0 {
                 let count = instances.len();
                 if count > 0 {
@@ -81,37 +104,29 @@ impl StrategyRunner {
                 }
             }
             
-            // Собираем завершённые
             let mut finished = Vec::new();
             
             for entry in instances.iter() {
                 let id = entry.key();
                 let inst = entry.value();
                 
-                let task_finished = inst.task.is_finished();
-                let bridge_finished = inst.bridge_task.is_finished();
-                
-                if task_finished {
+                if inst.task.is_finished() {
                     tracing::info!(
-                        "🔍 Instance '{}': task={}, bridge={}", 
+                        "🔍 Instance '{}': task=DONE, bridge={}", 
                         id, 
-                        if task_finished { "DONE" } else { "running" },
-                        if bridge_finished { "DONE" } else { "running" }
+                        if inst.bridge_task.is_finished() { "DONE" } else { "running" }
                     );
                     finished.push(id.clone());
                 }
             }
             
-            // Удаляем завершённые
             for id in finished {
                 if let Some((_, inst)) = instances.remove(&id) {
-                    // Останавливаем bridge если ещё работает
                     if !inst.bridge_task.is_finished() {
                         inst.stop_flag.store(true, Ordering::Relaxed);
                         inst.bridge_task.abort();
                     }
                     
-                    // Получаем exit code
                     let code = match inst.task.await {
                         Ok(c) => Some(c),
                         Err(e) => {
@@ -144,6 +159,26 @@ impl StrategyRunner {
         
         tracing::info!("📦 Starting '{}' with params: {}", instance_id, params_json);
         
+        // ═══════════════════════════════════════════════════════════
+        // User Data Stream
+        // ═══════════════════════════════════════════════════════════
+        let user_data_rx: Option<broadcast::Receiver<UserDataEvent>> = params
+            .get("api_key")
+            .and_then(|v| v.as_str())
+            .and_then(|api_key| {
+                let rx = self.user_data_manager.subscribe(api_key);
+                if rx.is_some() {
+                    tracing::info!("📡 User Data Stream attached for '{}'", instance_id);
+                }
+                rx
+            });
+        
+        let has_user_data = user_data_rx.is_some();
+        
+        let user_data_holder: Option<Arc<UserDataReceiverHolder>> = user_data_rx
+            .map(|rx| Arc::new(std::sync::Mutex::new(Some(rx))));
+        
+        // Загружаем библиотеку
         let lib: Arc<Library> = Arc::new(unsafe { Library::new(&lib_path)? });
         let run_fn: RunFn = unsafe { *lib.get(b"run")? };
         
@@ -161,13 +196,23 @@ impl StrategyRunner {
         };
         
         // Strategy task
+        // ═══════════════════════════════════════════════════════════
+        // ВАЖНО: передаём Arc внутрь, указатель получаем там
+        // ═══════════════════════════════════════════════════════════
         let task = {
             let instance_id = instance_id.clone();
             let symbol = symbol.clone();
             let lib = lib.clone();
             let stop_flag = stop_flag.clone();
+            let user_data_holder = user_data_holder.clone();  // Clone Arc (или None)
             
             tokio::task::spawn_blocking(move || {
+                // Получаем указатель ВНУТРИ spawn_blocking
+                let user_data_ptr: *const UserDataReceiverHolder = user_data_holder
+                    .as_ref()
+                    .map(|h| Arc::as_ptr(h))
+                    .unwrap_or(std::ptr::null());
+                
                 let result = Self::run_strategy(
                     instance_id.clone(), 
                     lib, 
@@ -176,6 +221,8 @@ impl StrategyRunner {
                     symbol, 
                     params_json,
                     stop_flag,
+                    user_data_ptr,
+                    user_data_holder,  // Передаём для ownership
                 );
                 
                 tracing::info!("📤 Task '{}' returning {}", instance_id, result);
@@ -189,6 +236,7 @@ impl StrategyRunner {
             symbol,
             params,
             started_at: chrono::Utc::now().timestamp(),
+            has_user_data,
         };
         
         self.instances.insert(instance_id.clone(), RunningInstance {
@@ -197,9 +245,10 @@ impl StrategyRunner {
             stop_flag,
             task,
             bridge_task,
+            _user_data_holder: user_data_holder,
         });
         
-        tracing::info!("✅ Instance '{}' started", instance_id);
+        tracing::info!("✅ Instance '{}' started (user_data={})", instance_id, has_user_data);
         Ok(info)
     }
     
@@ -218,7 +267,6 @@ impl StrategyRunner {
                 break;
             }
             
-            // Используем select с таймаутом чтобы проверять флаг
             match tokio::time::timeout(
                 tokio::time::Duration::from_millis(100),
                 event_rx.recv()
@@ -238,9 +286,7 @@ impl StrategyRunner {
                 Ok(Err(broadcast::error::RecvError::Lagged(n))) => {
                     tracing::warn!("'{}' lagged {} msgs", instance_id, n);
                 }
-                Err(_) => {
-                    // Таймаут - проверяем флаг на следующей итерации
-                }
+                Err(_) => {}
             }
         }
         
@@ -255,6 +301,8 @@ impl StrategyRunner {
         symbol: String,
         params_json: String,
         stop_flag: Arc<AtomicBool>,
+        user_data_ptr: *const UserDataReceiverHolder,
+        _user_data_holder: Option<Arc<UserDataReceiverHolder>>,  // Держим ownership
     ) -> i32 {
         tracing::info!("🚀 Strategy thread '{}' started", instance_id);
         
@@ -270,13 +318,13 @@ impl StrategyRunner {
             symbol_len: len as u8,
             params_json: params_cstring.as_ptr(),
             stop_flag: Arc::as_ptr(&stop_flag),
+            user_data_rx: user_data_ptr,
         };
         
         let rx_ptr = Box::into_raw(Box::new(sync_rx));
         
         let result = unsafe { run_fn(rx_ptr, place_order, cancel_order, config) };
         
-        // Ставим флаг чтобы bridge остановился
         stop_flag.store(true, Ordering::Relaxed);
         
         unsafe { let _ = Box::from_raw(rx_ptr); }
@@ -296,7 +344,6 @@ impl StrategyRunner {
         
         drop(entry);
         
-        // Ждём очистки
         for i in 0..100 {
             if !self.instances.contains_key(instance_id) {
                 tracing::info!("✅ '{}' stopped after {}ms", instance_id, i * 100);
@@ -305,7 +352,6 @@ impl StrategyRunner {
             tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
         }
         
-        // Force remove
         if let Some((_, inst)) = self.instances.remove(instance_id) {
             inst.bridge_task.abort();
             tracing::warn!("⚠️ '{}' force removed", instance_id);
