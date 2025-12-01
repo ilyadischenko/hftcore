@@ -368,7 +368,7 @@ impl ExchangeTrade {
                 
                 // НОВОЕ: JSON params
                 if *reduce_only {
-                    params_json.insert("reduceOnly".into(), Value::String("true".into()));
+                    params_json.insert("reduceOnly".into(), Value::Bool(true));
                 }
                 
                 params_json.insert("signature".into(), Value::String(signature));
@@ -422,7 +422,7 @@ impl ExchangeTrade {
                 
                 // НОВОЕ: JSON params
                 if *reduce_only {
-                    params_json.insert("reduceOnly".into(), Value::String("true".into()));
+                    params_json.insert("reduceOnly".into(), Value::Bool(true));
                 }
                 
                 params_json.insert("signature".into(), Value::String(signature));
