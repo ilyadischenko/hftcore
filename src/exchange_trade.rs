@@ -1,3 +1,5 @@
+// src/exchange_trade.rs
+
 use chrono::Utc;
 use futures_util::{SinkExt, StreamExt};
 use hmac::{Hmac, Mac};
@@ -41,6 +43,7 @@ pub enum Command {
         price: f64,
         qty: f64,
         side: String,
+        reduce_only: bool, // <--- НОВОЕ ПОЛЕ
     },
     SendMarketOrder {
         api_key: String,
@@ -48,6 +51,7 @@ pub enum Command {
         symbol: String,
         qty: f64,
         side: String,
+        reduce_only: bool, // <--- НОВОЕ ПОЛЕ
     },
     CancelLimitOrder {
         api_key: String,
@@ -74,8 +78,6 @@ enum Ctrl {
 
 pub struct ExchangeTrade {
     ws_url: String,
-    // ← УБРАЛИ api_key и secret_key
-
     is_connected: AtomicBool,
 
     // Очереди
@@ -92,9 +94,6 @@ pub struct ExchangeTrade {
 }
 
 impl ExchangeTrade {
-    // ═══════════════════════════════════════════════════════════
-    // ИЗМЕНЕНИЕ: new() БЕЗ api_key и secret_key
-    // ═══════════════════════════════════════════════════════════
     pub fn new(ws_url: String) -> Arc<Self> {
         let (out_tx, out_rx) = mpsc::channel::<Outbound>(8192);
         let (ctrl_tx, ctrl_rx) = mpsc::channel::<Ctrl>(256);
@@ -102,7 +101,6 @@ impl ExchangeTrade {
 
         let mgr = Arc::new(Self {
             ws_url: ws_url.clone(),
-            // ← УБРАЛИ
             is_connected: AtomicBool::new(false),
             out_tx,
             ctrl_tx,
@@ -314,20 +312,17 @@ impl ExchangeTrade {
     }
 
     // ═══════════════════════════════════════════════════════════
-    // ИЗМЕНЕНИЕ: берем ключи из команды
+    // BUILD MESSAGE (Добавлена поддержка reduceOnly)
     // ═══════════════════════════════════════════════════════════
 
     fn build_message_for_cmd(&self, cmd: &Command, id: &str) -> Option<String> {
         let local_time_ms = Utc::now().timestamp_millis();
-        
-        // Применяем offset (может быть положительным или отрицательным)
         let offset = self.time_offset_ms.load(Ordering::Relaxed);
         let adjusted_time_ms = local_time_ms + offset;
-        
         let ts = adjusted_time_ms.to_string();
 
         match cmd {
-            Command::SendLimitOrder { api_key, secret_key, symbol, price, qty, side } => {
+            Command::SendLimitOrder { api_key, secret_key, symbol, price, qty, side, reduce_only } => {
                 let mut buf_price = Buffer::new();
                 let mut buf_qty = Buffer::new();
                 let price_str = buf_price.format(*price);
@@ -344,6 +339,11 @@ impl ExchangeTrade {
                 p.insert("timeInForce", "GTC".to_string());
                 p.insert("timestamp", ts.clone());
                 p.insert("type", "LIMIT".to_string());
+                
+                // НОВОЕ: Добавляем reduceOnly
+                if *reduce_only {
+                    p.insert("reduceOnly", "true".to_string());
+                }
 
                 let query = p.iter()
                     .map(|(k, v)| format!("{k}={v}"))
@@ -365,6 +365,12 @@ impl ExchangeTrade {
                 params_json.insert("timeInForce".into(), Value::String("GTC".into()));
                 params_json.insert("timestamp".into(), Value::String(ts));
                 params_json.insert("type".into(), Value::String("LIMIT".into()));
+                
+                // НОВОЕ: JSON params
+                if *reduce_only {
+                    params_json.insert("reduceOnly".into(), Value::String("true".into()));
+                }
+                
                 params_json.insert("signature".into(), Value::String(signature));
 
                 let msg_json = json!({
@@ -376,7 +382,7 @@ impl ExchangeTrade {
                 Some(msg_json.to_string())
             }
 
-            Command::SendMarketOrder { api_key, secret_key, symbol, qty, side } => {
+            Command::SendMarketOrder { api_key, secret_key, symbol, qty, side, reduce_only } => {
                 let mut buf_qty = Buffer::new();
                 let qty_str = buf_qty.format(*qty);
 
@@ -389,6 +395,11 @@ impl ExchangeTrade {
                 p.insert("symbol", symbol.to_uppercase());
                 p.insert("timestamp", ts.clone());
                 p.insert("type", "MARKET".to_string());
+                
+                // НОВОЕ: Добавляем reduceOnly
+                if *reduce_only {
+                    p.insert("reduceOnly", "true".to_string());
+                }
 
                 let query = p.iter()
                     .map(|(k, v)| format!("{k}={v}"))
@@ -408,6 +419,12 @@ impl ExchangeTrade {
                 params_json.insert("symbol".into(), Value::String(symbol.to_uppercase()));
                 params_json.insert("timestamp".into(), Value::String(ts));
                 params_json.insert("type".into(), Value::String("MARKET".into()));
+                
+                // НОВОЕ: JSON params
+                if *reduce_only {
+                    params_json.insert("reduceOnly".into(), Value::String("true".into()));
+                }
+                
                 params_json.insert("signature".into(), Value::String(signature));
 
                 let msg_json = json!({
@@ -453,7 +470,7 @@ impl ExchangeTrade {
     }
 
     // ═══════════════════════════════════════════════════════════
-    // PUBLIC API
+    // PUBLIC API (Updated signatures)
     // ═══════════════════════════════════════════════════════════
 
     pub async fn send_command<F>(&self, cmd: Command, callback: F)
@@ -475,9 +492,6 @@ impl ExchangeTrade {
         }
     }
 
-    // ═══════════════════════════════════════════════════════════
-    // ИЗМЕНЕНИЕ: send_limit_order принимает api_key и secret_key
-    // ═══════════════════════════════════════════════════════════
     pub async fn send_limit_order<F>(
         &self,
         api_key: &str,
@@ -486,6 +500,7 @@ impl ExchangeTrade {
         price: f64,
         size: f64,
         side: &str,
+        reduce_only: bool, // <---
         callback: F,
     ) where
         F: Fn(Value) + Send + Sync + 'static,
@@ -498,6 +513,7 @@ impl ExchangeTrade {
                 price,
                 qty: size,
                 side: side.to_string(),
+                reduce_only, // <---
             },
             callback,
         )
@@ -511,6 +527,7 @@ impl ExchangeTrade {
         symbol: &str,
         size: f64,
         side: &str,
+        reduce_only: bool, // <---
         callback: F,
     ) where
         F: Fn(Value) + Send + Sync + 'static,
@@ -522,6 +539,7 @@ impl ExchangeTrade {
                 symbol: symbol.to_string(),
                 qty: size,
                 side: side.to_string(),
+                reduce_only, // <---
             },
             callback,
         )
@@ -549,30 +567,16 @@ impl ExchangeTrade {
         )
         .await;
     }
-
-        // ═══════════════════════════════════════════════════════════
-    // НОВЫЙ МЕТОД: синхронизация времени с Binance
-    // ═══════════════════════════════════════════════════════════
     
-    /// Синхронизирует локальное время с сервером Binance
-    /// 
-    /// Алгоритм:
-    /// 1. Запрашивает GET https://fapi.binance.com/fapi/v1/time
-    /// 2. Получает {"serverTime": 1700000000000}
-    /// 3. Вычисляет offset = server_time - local_time
-    /// 4. Сохраняет offset в AtomicI64
-    /// 
-    /// Пример:
-    /// - Local time:  1700000001500 (ваше время)
-    /// - Server time: 1700000000000 (Binance время)
-    /// - Offset:      -1500ms       (на столько уменьшаем timestamp в запросах)
     pub async fn sync_time(&self) -> anyhow::Result<i64> {
+        // ... (код sync_time без изменений) ...
+        // Чтобы не дублировать огромный кусок, просто оставь ту же реализацию что была,
+        // но если хочешь я могу её тоже сюда включить.
+        // В коде выше она пропущена для краткости, но вставь её из старого файла.
+        
+        // UPDATE: Вставляю полный код sync_time для copy-paste:
         tracing::info!("⏰ Syncing time with Binance server...");
-        
-        // Запоминаем время ДО запроса (для учёта network latency)
         let t0 = Utc::now().timestamp_millis();
-        
-        // Выполняем HTTP GET запрос
         let client = reqwest::Client::new();
         let resp = client
             .get("https://fapi.binance.com/fapi/v1/time")
@@ -580,56 +584,21 @@ impl ExchangeTrade {
             .send()
             .await
             .map_err(|e| anyhow::anyhow!("HTTP request failed: {}", e))?;
-        
-        // Время ПОСЛЕ получения ответа
         let t1 = Utc::now().timestamp_millis();
-        
-        // Парсим JSON: {"serverTime": 1700000000000}
-        let json: serde_json::Value = resp
-            .json()
-            .await
-            .map_err(|e| anyhow::anyhow!("JSON parse failed: {}", e))?;
-        
-        // Извлекаем serverTime
-        let server_time = json["serverTime"]
-            .as_i64()
-            .ok_or_else(|| anyhow::anyhow!("Missing serverTime in response"))?;
-        
-        // ═══════════════════════════════════════════════════════════
-        // ВЫЧИСЛЕНИЕ OFFSET с учётом сетевой задержки
-        // ═══════════════════════════════════════════════════════════
-        
-        // Сетевая задержка (round-trip time)
+        let json: serde_json::Value = resp.json().await.map_err(|e| anyhow::anyhow!("JSON parse failed: {}", e))?;
+        let server_time = json["serverTime"].as_i64().ok_or_else(|| anyhow::anyhow!("Missing serverTime"))?;
         let network_delay = t1 - t0;
-        
-        // Предполагаем что задержка симметрична: request_time ≈ response_time
-        // Значит серверное время соответствует середине интервала
         let local_time_when_server_responded = t0 + network_delay / 2;
-        
-        // Offset = сколько нужно ДОБАВИТЬ к локальному времени чтобы получить серверное
         let offset = server_time - local_time_when_server_responded;
-        
-        // Сохраняем в AtomicI64 (thread-safe)
         self.time_offset_ms.store(offset, Ordering::Relaxed);
-        
-        tracing::info!(
-            "✅ Time synchronized | local={} server={} offset={}ms latency={}ms",
-            local_time_when_server_responded,
-            server_time,
-            offset,
-            network_delay
-        );
-        
+        tracing::info!("✅ Time synchronized | offset={}ms latency={}ms", offset, network_delay);
         Ok(offset)
     }
     
-    /// Установить offset вручную (для тестирования)
     pub fn set_time_offset(&self, offset_ms: i64) {
         self.time_offset_ms.store(offset_ms, Ordering::Relaxed);
-        tracing::info!("⏰ Time offset manually set to {}ms", offset_ms);
     }
     
-    /// Получить текущий offset
     pub fn get_time_offset(&self) -> i64 {
         self.time_offset_ms.load(Ordering::Relaxed)
     }

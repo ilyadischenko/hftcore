@@ -219,6 +219,7 @@ async fn test_order(
             &req.symbol,
             req.quantity,
             &req.side,
+            false,
             move |resp: Value| {
                 let tx_clone = tx.clone();
                 tokio::spawn(async move {
@@ -495,6 +496,7 @@ async fn ping_order(
             safe_price,
             0.1,
             "BUY",
+            false,
             move |resp: Value| {
                 let tx = place_tx.clone();
                 tokio::spawn(async move {

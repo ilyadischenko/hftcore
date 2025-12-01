@@ -1,0 +1,19 @@
+[package]
+name = "funding_grid_precalc"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+chrono = { version = "0.4", features = ["clock"] }
+crossbeam = "0.8"
+serde = { version = "1.0", features = ["derive"] }  # ← ДОБАВИЛИ
+serde_json = "1.0"
+tokio = { version = "1", features = ["sync"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1

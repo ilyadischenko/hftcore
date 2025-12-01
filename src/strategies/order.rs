@@ -42,6 +42,7 @@ pub unsafe extern "C" fn place_order(
     quantity: f64,
     side: *const c_char,
     order_type: u8,        // 0 = LIMIT, 1 = MARKET
+    reduce_only: bool,     // <--- НОВЫЙ АРГУМЕНТ
     callback: OrderCallback,
 ) {
     let manager = TRADE_MANAGER.get().expect("Trading not initialized");
@@ -87,6 +88,7 @@ pub unsafe extern "C" fn place_order(
                     symbol,
                     quantity,
                     side,
+                    reduce_only, // <--- ПЕРЕДАЕМ ФЛАГ ДАЛЬШЕ
                     handle_resp,
                 )
                 .await;
@@ -100,6 +102,7 @@ pub unsafe extern "C" fn place_order(
                     price,
                     quantity,
                     side,
+                    reduce_only, // <--- ПЕРЕДАЕМ ФЛАГ ДАЛЬШЕ
                     handle_resp,
                 )
                 .await;
@@ -142,7 +145,7 @@ pub unsafe extern "C" fn cancel_order(
 }
 
 
-
+// ОБНОВЛЕННЫЙ TYPEDEF
 pub type PlaceOrderFn = unsafe extern "C" fn(
     api_key: *const c_char,
     secret_key: *const c_char,
@@ -151,6 +154,7 @@ pub type PlaceOrderFn = unsafe extern "C" fn(
     quantity: f64,
     side: *const c_char,
     order_type: u8,        // 0 = LIMIT, 1 = MARKET
+    reduce_only: bool,     // <--- ДОБАВИЛ СЮДА
     callback: OrderCallback,
 );
 
